@@ -10,6 +10,7 @@ import uuid
 
 from aiohttp import web
 
+import camera
 import devices
 import ha_api
 import mosquitto
@@ -251,6 +252,7 @@ async def handle_api_device_post(request):
     serial = request.match_info["serial"]
     try:
         data = await request.json()
+        data = _normalize_device_identity(serial, data)
         device = storage.save_device(serial, data)
         model = device.get("model", "")
         device_type = device.get("device_type", "")
@@ -275,6 +277,7 @@ async def handle_api_device_add(request):
         serial = data.get("serial", "").strip().upper()
         if not serial:
             return web.Response(status=400, text="serial required")
+        data = _normalize_device_identity(serial, data)
         device = storage.save_device(serial, data)
         model = device.get("model", "")
         device_type = device.get("device_type", "")
@@ -320,6 +323,7 @@ async def handle_api_device_delete(request):
     mqtt_user = deleted_cfg.get("mqtt_user", "") if remove_creds else ""
     mqtt_pass = deleted_cfg.get("mqtt_pass", "") if remove_creds else ""
 
+    await camera.stop_device(serial)
     await devices.retract_ha_discovery(serial, deleted_cfg, deleted_state)
     storage.delete_device(serial)
     devices.unregister_device(serial)
@@ -396,6 +400,9 @@ async def handle_api_device_command(request):
         # Normal command dicts fall through to send_command inside that function.
         await devices.handle_ha_command(serial, payload)
         return web.json_response({"status": "ok"})
+    except asyncio.TimeoutError as exc:
+        _LOGGER.warning("Device command timed out for %s...: %s", serial[:6], exc)
+        return web.Response(status=504, text="Device did not acknowledge the command")
     except Exception:
         _LOGGER.exception("Command failed for %s...", serial[:6])
         return web.Response(status=400, text="Bad request")
@@ -891,7 +898,28 @@ async def handle_api_device_image_upload(request):
 
 # ── Startup ────────────────────────────────────────────────────────────────
 
+def _normalize_device_identity(serial: str, cfg: dict) -> dict:
+    """Correct the AF0301 family to its observed PLAF203 MQTT product."""
+    if not serial.upper().startswith("AF0301"):
+        return cfg
+    corrections = {
+        "device_type": "camera_feeder",
+        "model": "AF03",
+    }
+    if any(cfg.get(key) != value for key, value in corrections.items()):
+        _LOGGER.warning(
+            "Correcting AF0301 device %s... from %s to PLAF203 camera feeder",
+            serial[:6],
+            cfg.get("device_type") or "unknown",
+        )
+        return {**cfg, **corrections}
+    return cfg
+
+
 async def on_startup(app):
+    bridge_ready = await camera.start_bridge()
+    if not bridge_ready:
+        _LOGGER.warning("PLAF203 camera support is unavailable until the bridge starts")
     settings = storage.get_settings()
     devices.configure(
         settings["mqtt_host"],
@@ -900,10 +928,19 @@ async def on_startup(app):
         settings["mqtt_pass"],
     )
     for serial, cfg in storage.get_devices().items():
+        normalized = _normalize_device_identity(serial, cfg)
+        if normalized is not cfg:
+            cfg = storage.save_device(serial, normalized)
         model = cfg.get("model", "")
         device_type = cfg.get("device_type", "")
         if model:
             devices.register_device(serial, model, device_type)
+        if device_type == "camera_feeder":
+            cached_state = devices.get_device_state(serial)
+            camera_uid = cached_state.get("camera_uid")
+            if isinstance(camera_uid, str) and camera_uid:
+                enabled = bool(cached_state.get("cameraSwitch", cached_state.get("enableCamera", False)))
+                asyncio.create_task(camera.update_device(serial, camera_uid, enabled))
     devices.suppress_alerts(True)
     await devices.start()
     _LOGGER.info("Petlibro Local v%s started", VERSION)
@@ -913,6 +950,10 @@ async def on_startup(app):
         devices.suppress_alerts(False)
         _LOGGER.debug("Startup alert suppression lifted")
     asyncio.ensure_future(_unsuppress())
+
+
+async def on_cleanup(app):
+    await camera.stop_bridge()
 
 
 _INGRESS_NETWORK = ipaddress.ip_network("172.30.32.0/23")
@@ -949,6 +990,7 @@ async def _restrict_api_middleware(request, handler):
 def main():
     app = web.Application(middlewares=[_restrict_api_middleware])
     app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
 
     app.router.add_get("/",                              handle_index)
     app.router.add_get("/icon.png",                      handle_icon)

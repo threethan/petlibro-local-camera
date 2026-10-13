@@ -65,6 +65,7 @@ const DEVICE_ICONS = {
   dockstream_rfid: "💧",
   one_rfid: "🐾",
   granary: "🥣",
+  camera_feeder: "📹",
 };
 
 const DEVICE_REQUIRES_PET = {

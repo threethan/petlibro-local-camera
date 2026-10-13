@@ -11,9 +11,11 @@ from .fountains import dockstream2
 from .fountains import dockstream_rfid
 from .feeders import one_rfid
 from .feeders import granary
+from .feeders import camera_feeder
 # from .litterboxes import luma  # (future)
 
-_MODULES = [dockstream2, dockstream_rfid, one_rfid, granary]
+_MODULES = [dockstream2, dockstream_rfid, one_rfid, granary, camera_feeder]
+FEEDER_TYPES = {"one_rfid", "granary", "camera_feeder"}
 
 _REGISTRY: dict = {}
 for _mod in _MODULES:

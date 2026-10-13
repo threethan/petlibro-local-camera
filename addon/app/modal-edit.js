@@ -174,6 +174,7 @@ const DEVICE_TYPE_MAP = {
   "WF03": { device_type: "dockstream2",         model: "WF03" },
   "WF04": { device_type: "dockstream2_cordless", model: "WF04" },
   "AF06": { device_type: "one_rfid",             model: "AF06" },
+  "AF0301": { device_type: "camera_feeder",      model: "AF03" },
   // AF01 (issue #8): Granary Smart Feeder, no RFID, no lid. Confirmed via a
   // real MQTT capture -- wire model is PLAF103, same as the box number this
   // time (no discrepancy).
@@ -185,6 +186,7 @@ const DEVICE_MQTT_MODELS = {
   "dockstream_rfid":      "plwf305",
   "one_rfid":             "plaf301",
   "granary":              "plaf103",
+  "camera_feeder":        "plaf103",
 };
 const DEVICE_VARIANTS = {
   "dockstream2":          [{ value: "b", label: "Black" }, { value: "w", label: "White" }],
@@ -196,6 +198,7 @@ const DEVICE_VARIANTS = {
   // Danny's own unit (issue #8) is white; black is a real retail color too
   // (Petlibro sells almost all their devices in both black and white).
   "granary":              [{ value: "b", label: "Black" }, { value: "w", label: "White" }],
+  "camera_feeder":        [{ value: "b", label: "Black" }, { value: "w", label: "White" }],
 };
 
 function deviceImageUrl(deviceType, variant) {

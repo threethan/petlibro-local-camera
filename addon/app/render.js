@@ -41,7 +41,7 @@ function renderDevices() {
     s: d.serial, o: d.online, w: d.currentWeight, i: d.intake_today_grams,
     f: d.filterNextReplacementTimestamp, r: d.rssi,
     sg: d.surplusGrain, eq: d.electricQuantity, pt: d.powerType, bd: d.barnDoorState,
-    img: d.image_url, name: d.name, room: d.room,
+    img: d.image_url, variant: d.variant, name: d.name, room: d.room,
     lct: d.last_cleaned_ts, lci: d.cleaning_interval_days,
     plans: (d.feeding_plans||[]).map(p=>p.executionTime+"_"+(p._enabled!==false?1:0)).join(),
     dt: d.display_text, din: d.display_icon_name, di: d.display_icon,
@@ -63,13 +63,16 @@ function renderDevices() {
   grid.innerHTML = sorted.map(d => {
     const online = d.online;
     const statusClass = online ? "online" : "offline";
-    const isFeeder = d.device_type === "one_rfid" || d.device_type === "granary";
+    const isFeeder = d.device_type === "one_rfid" || d.device_type === "granary" || d.device_type === "camera_feeder";
     const water = fmtWater(d.currentWeight ?? null);
     const filterDays = filterDaysRemaining(d);
     const cleanDays = cleaningDaysRemaining(d);
     const icon = deviceIcon(d);
-    const imgHtml = d.image_url
-      ? `<img src="${escHtml(d.image_url)}" alt="">`
+    const imageUrl = d.image_url || (d.device_type === "camera_feeder"
+      ? deviceImageUrl(d.device_type, d.variant || "b")
+      : "");
+    const imgHtml = imageUrl
+      ? `<img src="${escHtml(imageUrl)}" alt="">`
       : `<div class="card-img-placeholder">${icon}</div>`;
     const allPets = d.pets || [];
     const maxPetSlots = 5;

@@ -11,6 +11,8 @@ import json
 import logging
 import logging.handlers
 import os
+import time
+import uuid
 
 import aiomqtt
 import device_types as _device_types
@@ -167,6 +169,9 @@ _ADDON_START_TS = __import__("time").time()
 _online_since: dict[str, float] = {}
 _missed_feed_alerted: dict[tuple, float] = {}
 _pending_manual_feed: dict[str, float] = {}
+_pending_feed_acks: dict[tuple[str, str], asyncio.Future] = {}
+MANUAL_FEED_ACK_TIMEOUT_SECS = 10
+MQTT_PUBLISH_TIMEOUT_SECS = 5
 # Longest observed GRAIN_START -> GRAIN_END gap in real captures was well
 # under 10s; this is a generous window, not a measured firmware timeout.
 _MANUAL_FEED_WINDOW_SECS = 60
@@ -269,7 +274,7 @@ def _mark_online(serial: str):
                 # Feeders are left to _check_device_clock on the next heartbeat
                 # (about a minute away), which holds the correction if it would
                 # skip or repeat a meal. A blind push here could not tell.
-                if device_type not in ("one_rfid", "granary") and _last_seen[serial] - _last_reconnect_push.get(serial, 0.0) >= RECONNECT_PUSH_COOLDOWN_SECS:
+                if device_type not in _device_types.FEEDER_TYPES and _last_seen[serial] - _last_reconnect_push.get(serial, 0.0) >= RECONNECT_PUSH_COOLDOWN_SECS:
                     _last_reconnect_push[serial] = _last_seen[serial]
                     asyncio.ensure_future(_push_ntp_sync(serial, device_type))
 
@@ -312,6 +317,89 @@ def is_online(serial: str) -> bool:
     return _online.get(serial, False)
 
 
+async def publish_camera_image(serial: str, image: bytes) -> bool:
+    """Publish one raw JPEG frame for the MQTT camera entity."""
+    if _client_ref is None or not image:
+        return False
+    try:
+        await asyncio.wait_for(
+            _client_ref.publish(ha_mqtt.camera_image_topic(serial), image, retain=False),
+            timeout=MQTT_PUBLISH_TIMEOUT_SECS,
+        )
+        return True
+    except Exception:
+        _LOGGER.debug("Camera image publish failed for %s...", serial[:6], exc_info=True)
+        return False
+
+
+async def publish_camera_availability(serial: str, available: bool) -> bool:
+    if _client_ref is None:
+        return False
+    try:
+        await asyncio.wait_for(
+            _client_ref.publish(
+                ha_mqtt.camera_availability_topic(serial),
+                "online" if available else "offline",
+                retain=True,
+            ),
+            timeout=MQTT_PUBLISH_TIMEOUT_SECS,
+        )
+        return True
+    except Exception:
+        _LOGGER.debug("Camera availability publish failed for %s...", serial[:6], exc_info=True)
+        return False
+
+
+def _sync_camera(serial: str) -> None:
+    if _devices.get(serial, (None, None))[1] != "camera_feeder":
+        return
+    state = _state.get(serial, {})
+    uid = state.get("camera_uid")
+    if not isinstance(uid, str) or not uid:
+        return
+    enabled = bool(state.get("cameraSwitch", state.get("enableCamera", False)))
+    if "enableCamera" in state:
+        enabled = enabled and bool(state["enableCamera"])
+    import camera
+    asyncio.create_task(camera.update_device(serial, uid, enabled))
+
+
+async def publish_camera_image(serial: str, image: bytes) -> bool:
+    """Publish one raw JPEG frame for the MQTT camera entity."""
+    if _client_ref is None or not image:
+        return False
+    try:
+        await _client_ref.publish(ha_mqtt.camera_image_topic(serial), image, retain=False)
+        return True
+    except Exception:
+        _LOGGER.debug("Camera image publish failed for %s...", serial[:6], exc_info=True)
+        return False
+
+
+async def publish_camera_availability(serial: str, available: bool) -> None:
+    if _client_ref is None:
+        return
+    await _client_ref.publish(
+        ha_mqtt.camera_availability_topic(serial),
+        "online" if available else "offline",
+        retain=True,
+    )
+
+
+def _sync_camera(serial: str) -> None:
+    if _devices.get(serial, (None, None))[1] != "camera_feeder":
+        return
+    state = _state.get(serial, {})
+    uid = state.get("camera_uid")
+    if not isinstance(uid, str) or not uid:
+        return
+    enabled = bool(state.get("cameraSwitch", state.get("enableCamera", False)))
+    if "enableCamera" in state:
+        enabled = enabled and bool(state["enableCamera"])
+    import camera
+    asyncio.create_task(camera.update_device(serial, uid, enabled))
+
+
 # ── MQTT topic helpers ─────────────────────────────────────────────────────
 
 def _mqtt_model(device_type: str) -> str:
@@ -343,25 +431,77 @@ async def send_command(serial: str, payload: dict) -> bool:
     if _client_ref is None:
         _LOGGER.warning("send_command: no MQTT client")
         return False
-    if payload.get("cmd") == "MANUAL_FEEDING_SERVICE":
-        # Every manual dispense (Feed Now, the calibration wizard) is
-        # requested by us, unlike a scheduled feed which the feeder fires on
-        # its own with no command from this app. Recording when we asked
-        # lets _ack_grain_output tell the two apart in the activity log.
-        _pending_manual_feed[serial] = time.time()
     envelope = {
         "cmd":   "ATTR_SET_SERVICE",
         "ts":    int(time.time() * 1000),
-        "msgId": f"{serial}_{int(time.time())}",
+        "msgId": uuid.uuid4().hex,
         **payload,
     }
     try:
-        await _client_ref.publish(topic, json.dumps(envelope))
+        await asyncio.wait_for(
+            _client_ref.publish(topic, json.dumps(envelope)),
+            timeout=MQTT_PUBLISH_TIMEOUT_SECS,
+        )
+        if payload.get("cmd") == "MANUAL_FEEDING_SERVICE":
+            _pending_manual_feed[serial] = time.time()
         _LOGGER.debug("Command sent to %s...", serial[:6])
         return True
     except Exception:
         _LOGGER.exception("Failed to send command to %s...", serial[:6])
         return False
+
+
+async def send_manual_feed(serial: str, grain_num: int) -> bool:
+    """Send a one-shot dispense and wait briefly for the feeder's ACK."""
+    if type(grain_num) is not int or not 1 <= grain_num <= 48:
+        raise ValueError("grainNum must be an integer from 1 to 48")
+    if serial not in _devices:
+        raise RuntimeError(f"Unknown feeder {serial[:6]}")
+    if _client_ref is None:
+        raise RuntimeError("MQTT client is not connected")
+
+    _, device_type = _devices[serial]
+    topic = _service_sub_topic(device_type, serial)
+    loop = asyncio.get_running_loop()
+    msg_id = uuid.uuid4().hex
+    ack: asyncio.Future = loop.create_future()
+    key = (serial, msg_id)
+    _pending_feed_acks[key] = ack
+    payload = json.dumps({
+        "cmd": "MANUAL_FEEDING_SERVICE",
+        "ts": int(time.time() * 1000),
+        "msgId": msg_id,
+        "grainNum": grain_num,
+    })
+    try:
+        await asyncio.wait_for(
+            _client_ref.publish(topic, payload),
+            timeout=MQTT_PUBLISH_TIMEOUT_SECS,
+        )
+        _pending_manual_feed[serial] = time.time()
+        _LOGGER.info(
+            "Manual feed sent to %s... topic=%s msgId=%s portions=%d",
+            serial[:6], topic, msg_id, grain_num,
+        )
+        code = await asyncio.wait_for(ack, timeout=MANUAL_FEED_ACK_TIMEOUT_SECS)
+        if code != 0:
+            _LOGGER.warning("Manual feed rejected by %s...: code=%s", serial[:6], code)
+            return False
+        _LOGGER.info("Manual feed acknowledged by %s... msgId=%s", serial[:6], msg_id)
+        return True
+    except asyncio.TimeoutError:
+        _LOGGER.warning(
+            "Manual feed to %s... timed out waiting for MQTT publish or device ACK",
+            serial[:6],
+        )
+        raise
+    except Exception:
+        _LOGGER.exception("Failed to send manual feed to %s...", serial[:6])
+        raise
+    finally:
+        _pending_feed_acks.pop(key, None)
+        if not ack.done():
+            ack.cancel()
 
 
 def _granary_settings_bundle(serial: str, overrides: dict) -> dict:
@@ -827,7 +967,16 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
         _LOGGER.warning("Unrecognised HA command topic: %s", topic)
         return
     if cmd.get("_feed_now"):
-        ok = await send_command(serial, {"cmd": "MANUAL_FEEDING_SERVICE", "grainNum": 1})
+        try:
+            ok = await send_manual_feed(serial, 1)
+        except (RuntimeError, asyncio.TimeoutError):
+            ok = False
+        _LOGGER.info("HA Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
+    elif cmd.get("cmd") == "MANUAL_FEEDING_SERVICE":
+        try:
+            ok = await send_manual_feed(serial, cmd.get("grainNum", 1))
+        except (RuntimeError, ValueError, asyncio.TimeoutError):
+            ok = False
         _LOGGER.info("HA Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
     elif cmd.get("_open_door"):
         ok = await send_command(serial, {"cmd": "SWITCH_DOOR_SERVICE", "barnDoorState": True})
@@ -888,8 +1037,15 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
 async def handle_ha_command(serial: str, cmd: dict) -> None:
     """Public entry-point for API-driven commands (already-parsed dict)."""
     if cmd.get("_feed_now"):
-        ok = await send_command(serial, {"cmd": "MANUAL_FEEDING_SERVICE", "grainNum": 1})
+        ok = await send_manual_feed(serial, 1)
         _LOGGER.info("API Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
+        if not ok:
+            raise RuntimeError("Feeder rejected the manual feed")
+    elif cmd.get("cmd") == "MANUAL_FEEDING_SERVICE":
+        ok = await send_manual_feed(serial, cmd.get("grainNum", 1))
+        _LOGGER.info("API Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
+        if not ok:
+            raise RuntimeError("Feeder rejected the manual feed")
     elif cmd.get("_open_door"):
         ok = await send_command(serial, {"cmd": "SWITCH_DOOR_SERVICE", "barnDoorState": True})
         _LOGGER.info("API Open Door %s...: %s", serial[:6], "ok" if ok else "failed")
@@ -1052,7 +1208,11 @@ def _handle_message(serial: str, topic_str: str, raw: str):
     if cmd == "MANUAL_FEEDING_SERVICE":
         # Feeder ack for manual feed — code 0 = accepted.
         code = data.get("code")
-        _LOGGER.debug("MANUAL_FEEDING_SERVICE ack from %s... code=%s", serial[:6], code)
+        msg_id = data.get("msgId")
+        pending = _pending_feed_acks.get((serial, msg_id)) if isinstance(msg_id, str) else None
+        if pending is not None and not pending.done():
+            pending.set_result(code)
+        _LOGGER.info("MANUAL_FEEDING_SERVICE ack from %s... code=%s", serial[:6], code)
         _mark_online(serial)
         asyncio.ensure_future(_check_and_fire_alerts(serial))
         return
@@ -1277,6 +1437,12 @@ def _handle_message(serial: str, topic_str: str, raw: str):
             if key in data and _state.get(serial, {}).get(key) != data[key]:
                 _state.setdefault(serial, {})[key] = data[key]
                 version_changed = True
+        if _devices.get(serial, (None, None))[1] == "camera_feeder":
+            camera_uid = data.get("uuid")
+            if isinstance(camera_uid, str) and camera_uid:
+                _state.setdefault(serial, {})["camera_uid"] = camera_uid
+                asyncio.ensure_future(_persist_state_cache(serial))
+                _sync_camera(serial)
         if version_changed:
             # Also refresh HA's own Device Info panel (sw_version/hw_version
             # live in the discovery device block, not just a sensor state),
@@ -1355,6 +1521,8 @@ def _handle_message(serial: str, topic_str: str, raw: str):
                     except Exception:
                         _LOGGER.exception("Failed to record intake for %s...", serial[:6])
             asyncio.ensure_future(_persist_state_cache(serial))
+            if device_type == "camera_feeder" and ("cameraSwitch" in partial or "enableCamera" in partial):
+                _sync_camera(serial)
         _mark_online(serial)
         asyncio.ensure_future(_check_and_fire_alerts(serial))
         asyncio.ensure_future(_publish_ha_state(serial))
@@ -1875,7 +2043,8 @@ async def _respond_ntp(request_topic: str, device_ts_ms=None) -> None:
     # one post-boot time request goes unanswered. This records what a held
     # reply WOULD have been so that can be judged from real data first.
     try:
-        if (not _uses_cloud_time_sync(serial) and _devices.get(serial, (None, None))[1] in ("one_rfid", "granary")
+        if (not _uses_cloud_time_sync(serial)
+                and _devices.get(serial, (None, None))[1] in _device_types.FEEDER_TYPES
                 and isinstance(device_ts_ms, (int, float)) and device_ts_ms > 1e12):
             import time as _t
             req_offset = round(_t.time() - device_ts_ms / 1000.0)
@@ -2038,7 +2207,7 @@ async def _check_device_clock(serial: str, device_ts_ms) -> None:
     if not device_type:
         return
     skipped_meals = []
-    if device_type in ("one_rfid", "granary"):
+    if device_type in _device_types.FEEDER_TYPES:
         reason, meals = _clock_hold_reason(serial, offset, now)
         if reason:
             held_since = fix.setdefault("held_since", now)
@@ -2090,7 +2259,7 @@ async def _check_missed_feeds() -> None:
     settings = _storage.get_settings()
     devices_data = _storage.get_devices()
     for serial, (_, device_type) in list(_devices.items()):
-        if device_type not in ("one_rfid", "granary") or not _online.get(serial):
+        if device_type not in _device_types.FEEDER_TYPES or not _online.get(serial):
             continue
         cfg = devices_data.get(serial, {})
         if not cfg.get("notifications", {}).get("missed_feed", True):

@@ -4,8 +4,11 @@ function openDeviceModal(device) {
   _currentDeviceTab = "overview";
 
   const imgEl = document.getElementById("detail-img");
-  imgEl.innerHTML = device.image_url
-    ? `<img src="${escHtml(device.image_url)}" alt="">`
+  const imageUrl = device.image_url || (device.device_type === "camera_feeder"
+    ? deviceImageUrl(device.device_type, device.variant || "b")
+    : "");
+  imgEl.innerHTML = imageUrl
+    ? `<img src="${escHtml(imageUrl)}" alt="">`
     : `<span>${deviceIcon(device)}</span>`;
 
   document.getElementById("detail-name").textContent = device.name || device.device_type || device.serial;
@@ -57,7 +60,7 @@ function openDeviceModal(device) {
     clockEl.style.display = "none";
   }
 
-  const isFeeder = device.device_type === "one_rfid" || device.device_type === "granary";
+  const isFeeder = device.device_type === "one_rfid" || device.device_type === "granary" || device.device_type === "camera_feeder";
   const isFountain = device.device_type?.startsWith("dockstream");
   document.querySelectorAll(".dtab").forEach(b => {
     b.classList.toggle("active", b.dataset.dtab === "overview");
@@ -65,6 +68,7 @@ function openDeviceModal(device) {
     if (b.dataset.dtab === "schedule") b.style.display = isFeeder ? "" : "none";
     if (b.dataset.dtab === "led") b.style.display = device.device_type === "one_rfid" ? "" : "none";
     if (b.dataset.dtab === "controls") b.style.display = isFountain ? "" : "none";
+    if (b.dataset.dtab === "maintenance") b.style.display = "";
   });
 
   renderDeviceTab("overview");
@@ -83,7 +87,7 @@ function renderDeviceTab(tabName) {
   else if (tabName === "maintenance") content.innerHTML = buildMaintenanceTab(_currentDevice);
   else if (tabName === "log") {
     content.innerHTML = `<p style="color:var(--pl-subtext);padding:16px 0;text-align:center">Loading...</p>`;
-    if (_currentDevice.device_type === "one_rfid" || _currentDevice.device_type === "granary") {
+    if (_currentDevice.device_type === "one_rfid" || _currentDevice.device_type === "granary" || _currentDevice.device_type === "camera_feeder") {
       api("GET", `/api/devices/${_currentDevice.serial}/feeder-log`)
         .then(log => { content.innerHTML = buildFeederLogTab(_currentDevice, log); })
         .catch(() => { content.innerHTML = `<p style="color:var(--pl-danger);padding:16px 0">${t("device_modal.load_failed_log")}</p>`; });
@@ -238,9 +242,9 @@ function buildOverviewTab(device) {
     </div>` : ""}`;
   }
 
-  if (device.device_type === "granary") {
-    // No RFID, no lid on this model (issue #8) -- see device_types/feeders/
-    // granary.py for what's confirmed vs deliberately not built yet.
+  if (device.device_type === "granary" || device.device_type === "camera_feeder") {
+    // Both feeder types share the Granary controls; the registered model
+    // selects the correct MQTT product topic for device commands.
     const foodOk     = device.surplusGrain;
     const foodClass  = foodOk === false ? "danger" : "accent";
     const foodLabel  = foodOk === false ? t("food.low") : foodOk === true ? t("food.ok") : "—";
@@ -434,7 +438,7 @@ function buildLedTab(device) {
 
 // ── Maintenance tab ───────────────────────────────────────────────────────
 function buildMaintenanceTab(device) {
-  if (device.device_type === "one_rfid" || device.device_type === "granary") {
+  if (device.device_type === "one_rfid" || device.device_type === "granary" || device.device_type === "camera_feeder") {
     const foodDays = foodRefillDaysRemaining(device);
     const dDays    = desiccantDaysRemaining(device);
     const bowlDays = bowlDaysRemaining(device);
@@ -910,7 +914,7 @@ function buildScheduleTab(plans) {
 
   const _fu = _currentDevice?.feed_unit || "auto";
   const unitOpt = (v, key) => `<option value="${v}"${_fu === v ? " selected" : ""}>${t(key)}</option>`;
-  const calSection = (_currentDevice?.device_type === "one_rfid" || _currentDevice?.device_type === "granary") ? `
+  const calSection = (_currentDevice?.device_type === "one_rfid" || _currentDevice?.device_type === "granary" || _currentDevice?.device_type === "camera_feeder") ? `
     <div class="tab-section-heading" style="margin-top:18px">${t("feed_unit.heading")}</div>
     <select class="form-select" id="feed-unit-select">
       ${unitOpt("auto", "feed_unit.auto")}${unitOpt("cup", "feed_unit.cup")}${unitOpt("oz", "feed_unit.oz")}${unitOpt("g", "feed_unit.g")}${unitOpt("ml", "feed_unit.ml")}
@@ -1120,7 +1124,7 @@ function wireScheduleTabHandlers() {
 // ── Notifications tab ─────────────────────────────────────────────────────
 function buildNotificationsTab(device) {
   const notif = device.notifications || {};
-  const isFeeder = device.device_type === "one_rfid" || device.device_type === "granary";
+  const isFeeder = device.device_type === "one_rfid" || device.device_type === "granary" || device.device_type === "camera_feeder";
   const checks = device.device_type === "one_rfid" ? [
     { key: "food_low",        label: t("notif.food_low") },
     { key: "food_refill_due", label: t("notif.food_refill_due") },
@@ -1132,7 +1136,7 @@ function buildNotificationsTab(device) {
     { key: "missed_feed",   label: t("notif.missed_feed") },
     { key: "food_dispensed", label: t("notif.food_dispensed"), defaultOn: false },
     { key: "offline",       label: t("notif.offline") },
-  ] : device.device_type === "granary" ? [
+  ] : device.device_type === "granary" || device.device_type === "camera_feeder" ? [
     // No door_jam (no lid on this model) and no power_battery (powerType's
     // meaning isn't confirmed for this device yet, see granary.py)
     { key: "food_low",        label: t("notif.food_low") },
@@ -1400,9 +1404,8 @@ function wireDeviceTabHandlers(tabName) {
 
     _wireHours(d, "hrs-sound", "_sound_hours", ["sound_hours_mode", "sound_start_local", "sound_end_local"]);
 
-    // Granary Smart Feeder controls -- unlike the RFID feeder above, this
-    // device's real captures showed the vendor app always resending its
-    // full settings bundle together, never a lone changed field (see
+    // Granary-style feeder controls -- unlike the RFID feeder above, this
+    // settings path resends the complete bundle rather than a lone field (see
     // _granary_settings_bundle in devices.py), so these go through the
     // _granary_field/_granary_value flag instead of feederAutoSave's bare
     // single-field payloads.

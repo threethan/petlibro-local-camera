@@ -47,7 +47,9 @@ Petlibro Local automatically publishes MQTT discovery messages so Home Assistant
 
 Display hours, sound hours and the schedule pause and skip controls are in the app's web UI only; they are not Home Assistant entities yet.
 
-## Granary Smart Feeder
+## Granary and Smart Camera Feeders
+
+The Smart Camera Feeder exposes the same entities as the Granary; its commands use the `PLAF203` MQTT model instead of `PLAF103`.
 
 | Entity | Type | Description |
 |--------|------|-------------|
@@ -59,6 +61,8 @@ Display hours, sound hours and the schedule pause and skip controls are in the a
 | Last Fed | Sensor | Timestamp of the last dispense |
 | Next Meal | Sensor (diagnostic) | Timestamp of the next enabled scheduled feeding |
 | Desiccant Days Remaining | Sensor (diagnostic) | Days until desiccant replacement is due |
+
+The PLAF203 Smart Camera Feeder also creates a **Camera** entity. It receives a fresh JPEG snapshot about every five seconds while both `cameraSwitch` and `enableCamera` are on. Snapshots use the feeder's direct-LAN H.264 path; they stop when the feeder camera is disabled. This is a periodically refreshed image, not a continuous WebRTC player.
 
 ## Fountains (Dockstream 2 and the other fountain models)
 

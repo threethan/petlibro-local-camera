@@ -27,6 +27,10 @@ Back to the [README](../README.md).
 
 ## Feeders
 
+### Smart Camera Feeder (PLAF203)
+
+When the feeder camera is enabled, Petlibro Local registers the camera UID from `DEVICE_START_EVENT` with the bundled direct-LAN bridge. Home Assistant discovers a Camera entity through MQTT and receives a JPEG snapshot roughly every five seconds. The bridge API and RTSP listener bind to loopback only; camera access does not use Petlibro cloud credentials or require internet access. The HA entity is snapshot-based, not a continuous WebRTC stream.
+
 ### Feeder Monitoring
 - Next meal time pulled from the active feeding schedule and shown on the device card, converted to your local timezone
 - Last Fed time: updates whenever food is actually dispensed (scheduled or manual). On the One RFID feeder it also updates when a qualifying eating session is detected, meaning the feeder door opens and closes after at least the configured minimum eating duration (default 30 seconds, adjustable per device)
@@ -81,7 +85,7 @@ Choose how feed amounts are shown for each feeder (cup, oz, g or ml, like the Pe
 
 ### Feed Amount Calibration (Optional)
 
-The One RFID and Granary feeders dispense through a fixed-volume scoop rather than a scale, so one "portion" doesn't weigh the same for every food. Out of the box, Petlibro Local assumes 10g per portion everywhere it shows an amount (Feed Now, schedules, activity log). If you'd rather see real numbers for your specific food, you can calibrate.
+The One RFID, Granary, and Smart Camera feeders dispense through a fixed-volume scoop rather than a scale, so one "portion" doesn't weigh the same for every food. Out of the box, Petlibro Local assumes 10g per portion everywhere it shows an amount (Feed Now, schedules, activity log). If you'd rather see real numbers for your specific food, you can calibrate.
 
 **This is entirely optional.** If you never calibrate, nothing changes and everything keeps using 10g per portion. Calibration only changes how amounts are *displayed*; it does not change how much food the feeder dispenses.
 
@@ -126,7 +130,7 @@ Petlibro Local sends notifications through the channels you turn on:
 | Filter replacement due | Filter days remaining reaches 3 or fewer |
 | Cleaning overdue | Fountain or bowl cleaning interval exceeded |
 | Food door jammed | One RFID Smart Feeder reports its door couldn't close, usually a pet blocking it |
-| Scheduled feed missed | An enabled feeding plan is more than 5 minutes past its time and nothing was dispensed (One RFID and Granary feeders) |
+| Scheduled feed missed | An enabled feeding plan is more than 5 minutes past its time and nothing was dispensed (One RFID, Granary, and Smart Camera feeders) |
 | Food dispensed | Optional, off by default: every dispense, labeled Manual or Scheduled |
 
 **Pet activity notifications** fire when an RFID eating session is detected: "Zoey ate for 3m25s at Zoey's Feeder." These use the same notification channels as device alerts and can be enabled or disabled per pet.

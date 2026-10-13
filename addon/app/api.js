@@ -23,7 +23,15 @@ async function loadAll() {
 function deviceAlerts(device) {
   const notif = device.notifications || {};
   const alerts = [];
-  if (device.device_type === "one_rfid") {
+  if (device.device_type === "granary" || device.device_type === "camera_feeder") {
+    if (notif.food_low !== false && device.online && device.surplusGrain === false) alerts.push("food_low");
+    if (notif.food_refill_due !== false) { const d = foodRefillDaysRemaining(device); if (d != null && d <= 0) alerts.push("food_refill_due"); }
+    if (notif.desiccant_due !== false) { const d = desiccantDaysRemaining(device); if (d != null && d <= 0) alerts.push("desiccant_due"); }
+    if (notif.bowl_due !== false) { const d = bowlDaysRemaining(device); if (d != null && d <= 0) alerts.push("bowl_due"); }
+    if (notif.housing_due !== false) { const d = housingDaysRemaining(device); if (d != null && d <= 0) alerts.push("housing_due"); }
+    const batteryThreshold = device.battery_low_pct ?? 20;
+    if (batteryThreshold > 0 && device.electricQuantity > 0 && device.electricQuantity <= batteryThreshold) alerts.push("battery_low");
+  } else if (device.device_type === "one_rfid") {
     if (notif.food_low !== false && device.online && device.surplusGrain === false) alerts.push("food_low");
     if (notif.bowl_due !== false) { const d = bowlDaysRemaining(device); if (d != null && d <= 0) alerts.push("bowl_due"); }
     if (notif.housing_due !== false) { const d = housingDaysRemaining(device); if (d != null && d <= 0) alerts.push("housing_due"); }

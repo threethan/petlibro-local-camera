@@ -14,6 +14,10 @@ Back to the [README](../README.md). The table of supported devices is there; the
 
 **One RFID Smart Feeder:** Significantly different from the fountain: RFID door, desiccant tray, feeding plan, display matrix, sound, and lid controls. Serial prefix confirmed as `AF06`, MQTT model confirmed as `PLAF301`. Color variant does not appear to be encoded at positions 10-11 the way fountain serials are. Note that Petlibro's product listing shows this device as model `PLAF103`; that's the retail box/product number and is unrelated to `PLAF301`, which is the MQTT topic model this app matches on. Serials on newer hardware revisions run a few characters longer than early units but use the same `AF06` prefix and work the same way.
 
+**Smart Camera Feeder:** An `AF0301...` device reports product ID `PLAF203` in its MQTT topics (captured on firmware 3.0.30 / hardware 1.0.7). It supports the full Granary feature set, but uses its own `camera_feeder` device type so Petlibro Local routes MQTT traffic to `PLAF203` rather than the Granary's `PLAF103`. Existing AF0301 entries saved under another type are corrected automatically.
+
+With the feeder camera enabled, the add-on also registers the `uuid` from `DEVICE_START_EVENT` with its pinned PLAF203 direct-LAN bridge. Home Assistant receives raw JPEG snapshots over MQTT approximately every five seconds. No cloud camera credentials are used; the HA entity is snapshot-based, not a continuous video player.
+
 ## Firmware versions I have seen
 
 | Device | Firmware | Hardware |

@@ -24,6 +24,7 @@ _MODEL_NAMES = {
     "dockstream_rfid":      "Dockstream RFID Smart Fountain",
     "one_rfid":             "One RFID Smart Feeder",
     "granary":              "Granary Smart Feeder",
+    "camera_feeder":        "Petlibro Granary with Camera",
 }
 
 _FOUNTAIN_TYPES = {"dockstream2", "dockstream2_cordless", "dockstream_rfid"}
@@ -89,6 +90,12 @@ def state_topic(serial: str, key: str) -> str:
 def cmd_topic(serial: str, key: str) -> str:
     return f"{_STATE_PREFIX}/{serial}/{key}/set"
 
+def camera_image_topic(serial: str) -> str:
+    return f"{_STATE_PREFIX}/{serial}/camera/image"
+
+def camera_availability_topic(serial: str) -> str:
+    return f"{_STATE_PREFIX}/{serial}/camera/availability"
+
 def _oid(serial: str, key: str) -> str:
     """Globally unique ID — full serial keeps it collision-free."""
     return f"petlibro_{serial}_{key}"
@@ -152,6 +159,13 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
         "device_class":        "signal_strength",
         "state_class":         "measurement",
         "entity_category":     "diagnostic",
+    })))
+
+    entities.append(("sensor", "next_meal", _e(serial, "next_meal", b, {
+        "name":         "Next Meal",
+        "state_topic":  state_topic(serial, "next_meal"),
+        "device_class": "timestamp",
+        "icon":         "mdi:clock-outline",
     })))
 
     entities.append(("sensor", "firmware", _e(serial, "firmware", b, {
@@ -351,8 +365,8 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
             "icon":          "mdi:movie-open-outline",
         })))
 
-    # ── Granary Smart Feeder (no RFID, no lid) ───────────────────────────────
-    elif device_type == "granary":
+    # ── Granary-style feeders (no RFID, no lid) ─────────────────────────────
+    elif device_type in ("granary", "camera_feeder"):
         entities.append(("sensor", "battery", _e(serial, "battery", b, {
             "name":                "Battery",
             "state_topic":         state_topic(serial, "battery"),
@@ -420,6 +434,19 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
             "icon":          "mdi:volume-high",
         })))
 
+        if device_type == "camera_feeder":
+            camera_base = {
+                "unique_id": _oid(serial, "camera"),
+                "object_id": _obj_id(serial, "camera"),
+                "name": "Camera",
+                "topic": camera_image_topic(serial),
+                "availability_topic": camera_availability_topic(serial),
+                "payload_available": "online",
+                "payload_not_available": "offline",
+                "device": _device_block(serial, cfg, state),
+            }
+            entities.append(("camera", "camera", camera_base))
+
     return entities
 
 
@@ -477,7 +504,7 @@ def get_command_topics(serial: str, device_type: str) -> list[str]:
         topics.append(cmd_topic(serial, "display_icon"))
         topics.append(cmd_topic(serial, "display_animation"))
         topics.append(cmd_topic(serial, "display_switch"))
-    elif device_type == "granary":
+    elif device_type in ("granary", "camera_feeder"):
         topics.append(cmd_topic(serial, "feed_now"))
         topics.append(cmd_topic(serial, "volume"))
         topics.append(cmd_topic(serial, "light"))
@@ -648,9 +675,8 @@ async def publish_state(client, serial: str, cfg: dict, state: dict, plans: list
             anim_name = NO_ANIMATION_LABEL
         await client.publish(state_topic(serial, "display_animation"), anim_name, retain=True)
 
-    # Granary Smart Feeder (no RFID, no lid, no display -- see device_types
-    # module docstring for what's deliberately not implemented and why)
-    elif device_type == "granary":
+    # Granary-style feeders (no RFID, no lid, no display).
+    elif device_type in ("granary", "camera_feeder"):
         if "electricQuantity" in state:
             await client.publish(state_topic(serial, "battery"), str(state["electricQuantity"]), retain=True)
 
@@ -692,7 +718,6 @@ async def publish_state(client, serial: str, cfg: dict, state: dict, plans: list
             val = "ON" if state["disableHardwareButton"] else "OFF"
             await client.publish(state_topic(serial, "buttons_lock"), val, retain=True)
 
-
 def parse_command(topic: str, payload: str, device_type: str = "") -> dict | None:
     """Parse an HA command topic into a device payload dict.
 
@@ -709,12 +734,11 @@ def parse_command(topic: str, payload: str, device_type: str = "") -> dict | Non
     if key == "light":
         if device_type == "one_rfid":
             return {"screenDisplaySwitch": payload == "ON"}
-        if device_type == "granary":
-            # Granary's own real ATTR_SET_SERVICE captures always resend its
-            # full settings snapshot together (volume/audioUrl/enableAudio/
-            # lightSwitch/lightAgingType/disableHardwareButton), never a lone
-            # changed field alone -- flagged here so devices.py can build
-            # that same bundle from currently-known state (see
+        if device_type in ("granary", "camera_feeder"):
+            # Granary-style settings are sent as a full snapshot (volume/
+            # audioUrl/enableAudio/lightSwitch/lightAgingType/
+            # disableHardwareButton), not as a lone changed field. Flag this
+            # so devices.py can build that bundle from current state (see
             # _granary_settings_bundle in devices.py).
             return {"_granary_field": "lightSwitch", "_granary_value": payload == "ON"}
         return {"lightSwitch": 1 if payload == "ON" else 0}
@@ -729,7 +753,7 @@ def parse_command(topic: str, payload: str, device_type: str = "") -> dict | Non
             vol = int(float(payload))
         except (ValueError, TypeError):
             return None
-        if device_type == "granary":
+        if device_type in ("granary", "camera_feeder"):
             return {"_granary_field": "volume", "_granary_value": vol}
         return {"volume": vol}
     if key == "display_text":

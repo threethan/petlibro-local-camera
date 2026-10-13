@@ -48,6 +48,7 @@ If you are not comfortable with these terms, do not use this software.
 | Dockstream RFID Smart Fountain | WF02 | PLWF305 | Beta |
 | One RFID Smart Feeder | AF06 | PLAF301 | Supported |
 | Granary Smart Feeder | AF01 | PLAF103 | Beta |
+| Smart Camera Feeder | AF0301... | PLAF203 | Supported (HA snapshots) |
 
 Notes on each model (the Granary's missing lid and RFID, the WF01 labeling, serial color codes, and the model numbers) are in [Supported device notes](docs/devices.md), along with the firmware versions I have seen.
 
@@ -92,6 +93,7 @@ The full list, with details, is in [Features](docs/features.md). In short:
 
 - **Fountains:** live water level, filter countdown, drink log, pump, light and light schedule controls
 - **Feeders:** Feed Now, lid control, backup battery status, last fed and next meal, maintenance reminders for the food tank, desiccant, bowl and housing
+- **PLAF203 camera:** Home Assistant Camera entity with direct-LAN JPEG snapshots while the feeder camera is enabled
 - **Feeding schedules:** edit meals in the app, pause every schedule at once, or skip a plan's next feeding
 - **Feed amounts:** show portions as cups, ounces, grams or milliliters, with an optional calibration for your food
 - **Sound and LED (One RFID):** Device Sound hours, LED display hours, scrolling text, your own icons, built-in and custom LED animations with an animation editor, and custom feed sounds
@@ -104,7 +106,7 @@ The full list, with details, is in [Features](docs/features.md). In short:
 
 ## Feed Amount Calibration (Optional)
 
-The One RFID and Granary feeders dispense through a fixed-volume scoop rather than a scale, so one "portion" doesn't weigh the same for every food. By default I assume 10g per portion, and an optional calibration wizard on the Schedule tab shows real grams or ounces for your food. It only changes how amounts are *displayed*. The steps are in [Features](docs/features.md#feed-amount-calibration-optional).
+The One RFID, Granary, and Smart Camera feeders dispense through a fixed-volume scoop rather than a scale, so one "portion" doesn't weigh the same for every food. By default I assume 10g per portion, and an optional calibration wizard on the Schedule tab shows real grams or ounces for your food. It only changes how amounts are *displayed*. The steps are in [Features](docs/features.md#feed-amount-calibration-optional).
 
 ---
 
@@ -164,6 +166,12 @@ Once the repository is added:
 6. Click **Open Web UI** or use the Petlibro Local link in the sidebar.
 
 > ⚠️ **First run**: the Settings tab opens automatically if MQTT credentials are not configured. The app needs its own Mosquitto account (separate from device accounts). Create a dedicated user in the Mosquitto broker configuration, enter the credentials in the Settings tab, and tap Save Settings. A green indicator confirms the connection before you proceed to add devices.
+
+### Local Development with VS Code
+
+For local development, enable the Samba add-on and make its `addons` share available at `\\homeassistant.local\addons`. Also install and configure the **Terminal & SSH** app: add an SSH public key to `authorized_keys`, set a port under **Network**, save, and restart the app (the default expected here is 22). On Windows, create a key if needed with `ssh-keygen -t ed25519 -f "$HOME\.ssh\id_ed25519"` and add the contents of `id_ed25519.pub` to the app configuration. Keep SSH access restricted to your trusted local network.
+
+From the VS Code workspace containing this project, run **Deploy & build Petlibro Local (Home Assistant)** from the Tasks menu. The task copies `addon/` into the local add-ons folder, connects to the Terminal & SSH app, refreshes the local app store, then installs or rebuilds and starts Petlibro Local using the Home Assistant CLI. It uses the existing `$HOME\.ssh\id_ed25519` private key by default; update `$sshPort` and `$sshKeyPath` in `.vscode/deploy-petlibro.ps1` if your SSH port or key path differs. The task opens `http://homeassistant.local/` when deployment finishes.
 
 ---
 
