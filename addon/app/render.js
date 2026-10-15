@@ -71,7 +71,7 @@ function renderDevices() {
         </div>`
       : "";
 
-    return `<div class="device-card" data-serial="${escHtml(d.serial)}">
+    return `<div class="ha-card device-card" data-serial="${escHtml(d.serial)}">
       <div class="card-img-wrap">
         ${imgHtml}
         <div class="card-status ${statusClass}"><svg viewBox="0 0 24 18" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M12 14a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm-4.24-2.83a6 6 0 0 1 8.48 0l-1.42 1.42a4 4 0 0 0-5.65 0L7.76 11.17zm-2.83-2.83a10 10 0 0 1 14.14 0l-1.42 1.42a8 8 0 0 0-11.31 0L4.93 8.34zM1.1 5.51a15 15 0 0 1 21.21 0l-1.42 1.42a13 13 0 0 0-18.38 0L1.1 5.51z"/></svg></div>
@@ -103,7 +103,7 @@ function renderDevices() {
           </div>
           `}
           ${(() => { const nm = nextMealLabel(d.feeding_plans); return nm ? `<div class="card-stat stat-secondary"><div class="stat-label">${t("card.next_meal")}</div><div class="stat-value">${escHtml(nm)}</div></div>` : ""; })()}
-          ${(() => { if (!d.last_fed_ts) return ""; const lf = new Date(d.last_fed_ts * 1000); const now = new Date(); const diffH = (now - lf) / 3600000; let label; if (diffH < 1) label = t("time.ago_minutes", {n: Math.round(diffH * 60)}); else if (diffH < 24) label = _fmt12h(lf.getHours(), lf.getMinutes()); else label = t(_WDAY_KEYS[lf.getDay()]) + " " + _fmt12h(lf.getHours(), lf.getMinutes()); return `<div class="card-stat stat-secondary"><div class="stat-label">${t("card.last_fed")}</div><div class="stat-value">${escHtml(label)}</div></div>`; })()}
+          ${(() => { if (!d.last_fed_ts) return ""; return `<div class="card-stat stat-secondary"><div class="stat-label">${t("card.last_fed")}</div><div class="stat-value">${escHtml(lastFedLabel(d.last_fed_ts))}</div></div>`; })()}
           ${(() => { const lbl = _fmtDisplayLabel(d); if (!lbl) return ""; const short = lbl.length > 9 ? lbl.slice(0, 8) + "…" : lbl; return `<div class="card-stat stat-secondary"><div class="stat-label">${t("card.display")}</div><div class="stat-value" title="${escHtml(lbl)}">${escHtml(short)}</div></div>`; })()}
           ` : `
           <div class="card-stat">

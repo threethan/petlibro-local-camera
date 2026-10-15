@@ -202,8 +202,32 @@ _online_since: dict[str, float] = {}
 _missed_feed_alerted: dict[tuple, float] = {}
 _pending_manual_feed: dict[str, float] = {}
 _pending_feed_acks: dict[tuple[str, str], asyncio.Future] = {}
+_manual_feed_requests: dict[str, tuple[str, float]] = {}
 MANUAL_FEED_ACK_TIMEOUT_SECS = 10
 MQTT_PUBLISH_TIMEOUT_SECS = 5
+MANUAL_FEED_PENDING_TIMEOUT_SECS = 600
+
+
+class ManualFeedBusyError(RuntimeError):
+    """A previous dispense has not reported completion yet."""
+
+
+class ManualFeedPendingError(RuntimeError):
+    """The command was published, but the feeder has not acknowledged it yet."""
+
+
+def manual_feed_pending(serial: str) -> bool:
+    request = _manual_feed_requests.get(serial)
+    if request is None:
+        return False
+    if time.monotonic() - request[1] < MANUAL_FEED_PENDING_TIMEOUT_SECS:
+        return True
+    _manual_feed_requests.pop(serial, None)
+    _LOGGER.warning("Manual feed completion not observed for %s... after %ds; allowing another request",
+                    serial[:6], MANUAL_FEED_PENDING_TIMEOUT_SECS)
+    return False
+
+
 # Longest observed GRAIN_START -> GRAIN_END gap in real captures was well
 # under 10s; this is a generous window, not a measured firmware timeout.
 _MANUAL_FEED_WINDOW_SECS = 60
@@ -324,6 +348,7 @@ def _mark_offline(serial: str):
 
 def unregister_device(serial: str):
     _devices.pop(serial, None)
+    _manual_feed_requests.pop(serial, None)
     _state.pop(serial, None)
     _online.pop(serial, None)
     _offline_since.pop(serial, None)
@@ -340,7 +365,8 @@ def get_device_state(serial: str) -> dict:
 def get_all_states() -> dict:
     return {
         serial: {**_state.get(serial, {}), "online": _online.get(serial, False),
-                 "clock_offset_secs": _clock_offset.get(serial)}
+                 "clock_offset_secs": _clock_offset.get(serial),
+                 "manual_feed_pending": manual_feed_pending(serial)}
         for serial in _devices
     }
 
@@ -504,18 +530,22 @@ async def send_command(serial: str, payload: dict) -> bool:
 
 
 async def send_manual_feed(serial: str, grain_num: int) -> bool:
-    """Send a one-shot dispense and wait briefly for the feeder's ACK."""
+    """Send one dispense; keep it pending until the feeder reports completion."""
     if type(grain_num) is not int or not 1 <= grain_num <= 48:
         raise ValueError("grainNum must be an integer from 1 to 48")
     if serial not in _devices:
         raise RuntimeError(f"Unknown feeder {serial[:6]}")
     if _client_ref is None:
         raise RuntimeError("MQTT client is not connected")
+    if manual_feed_pending(serial):
+        raise ManualFeedBusyError("A previous feed is still pending")
 
     _, device_type = _devices[serial]
     topic = _service_sub_topic(device_type, serial)
     loop = asyncio.get_running_loop()
     msg_id = uuid.uuid4().hex
+    started = time.monotonic()
+    _manual_feed_requests[serial] = (msg_id, started)
     ack: asyncio.Future = loop.create_future()
     key = (serial, msg_id)
     _pending_feed_acks[key] = ack
@@ -525,11 +555,17 @@ async def send_manual_feed(serial: str, grain_num: int) -> bool:
         "msgId": msg_id,
         "grainNum": grain_num,
     })
+    published = False
     try:
-        await asyncio.wait_for(
-            _client_ref.publish(topic, payload),
-            timeout=MQTT_PUBLISH_TIMEOUT_SECS,
-        )
+        try:
+            await asyncio.wait_for(
+                _client_ref.publish(topic, payload),
+                timeout=MQTT_PUBLISH_TIMEOUT_SECS,
+            )
+        except Exception:
+            _manual_feed_requests.pop(serial, None)
+            raise
+        published = True
         _pending_manual_feed[serial] = time.time()
         _LOGGER.info(
             "Manual feed sent to %s... topic=%s msgId=%s portions=%d",
@@ -537,17 +573,23 @@ async def send_manual_feed(serial: str, grain_num: int) -> bool:
         )
         code = await asyncio.wait_for(ack, timeout=MANUAL_FEED_ACK_TIMEOUT_SECS)
         if code != 0:
+            _manual_feed_requests.pop(serial, None)
             _LOGGER.warning("Manual feed rejected by %s...: code=%s", serial[:6], code)
             return False
-        _LOGGER.info("Manual feed acknowledged by %s... msgId=%s", serial[:6], msg_id)
+        _LOGGER.info("Manual feed acknowledged by %s... msgId=%s after %.1fs; awaiting dispense",
+                     serial[:6], msg_id, time.monotonic() - started)
         return True
     except asyncio.TimeoutError:
-        _LOGGER.warning(
-            "Manual feed to %s... timed out waiting for MQTT publish or device ACK",
-            serial[:6],
-        )
-        raise
+        if not published:
+            raise
+        if not manual_feed_pending(serial):
+            _LOGGER.info("Manual feed completed for %s... before its ACK arrived", serial[:6])
+            return True
+        _LOGGER.warning("Manual feed to %s... published but no ACK after %.1fs; dispense may still occur",
+                        serial[:6], time.monotonic() - started)
+        raise ManualFeedPendingError("Feed command sent; waiting for feeder confirmation")
     except Exception:
+        _manual_feed_requests.pop(serial, None)
         _LOGGER.exception("Failed to send manual feed to %s...", serial[:6])
         raise
     finally:
@@ -1021,12 +1063,18 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
     if cmd.get("_feed_now"):
         try:
             ok = await send_manual_feed(serial, 1)
+        except (ManualFeedBusyError, ManualFeedPendingError) as exc:
+            _LOGGER.info("HA Feed Now %s...: %s", serial[:6], exc)
+            return
         except (RuntimeError, asyncio.TimeoutError):
             ok = False
         _LOGGER.info("HA Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
     elif cmd.get("cmd") == "MANUAL_FEEDING_SERVICE":
         try:
             ok = await send_manual_feed(serial, cmd.get("grainNum", 1))
+        except (ManualFeedBusyError, ManualFeedPendingError) as exc:
+            _LOGGER.info("HA Feed Now %s...: %s", serial[:6], exc)
+            return
         except (RuntimeError, ValueError, asyncio.TimeoutError):
             ok = False
         _LOGGER.info("HA Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
@@ -1390,6 +1438,12 @@ def _handle_message(serial: str, topic_str: str, raw: str):
         pending = _pending_feed_acks.get((serial, msg_id)) if isinstance(msg_id, str) else None
         if pending is not None and not pending.done():
             pending.set_result(code)
+        request = _manual_feed_requests.get(serial)
+        if request is not None and request[0] == msg_id:
+            _LOGGER.info("Manual feed ACK from %s... code=%s after %.1fs",
+                         serial[:6], code, time.monotonic() - request[1])
+            if code != 0:
+                _manual_feed_requests.pop(serial, None)
         _LOGGER.info("MANUAL_FEEDING_SERVICE ack from %s... code=%s", serial[:6], code)
         _mark_online(serial)
         asyncio.ensure_future(_check_and_fire_alerts(serial))
@@ -1397,6 +1451,11 @@ def _handle_message(serial: str, topic_str: str, raw: str):
 
     if cmd == "GRAIN_OUTPUT_EVENT":
         # Feeder reports grain dispensing progress. Ack it, and track intake on completion.
+        request = _manual_feed_requests.get(serial)
+        if request is not None and data.get("finished"):
+            _manual_feed_requests.pop(serial, None)
+            _LOGGER.info("Manual feed dispense completed for %s... after %.1fs portions=%s",
+                         serial[:6], time.monotonic() - request[1], data.get("actualGrainNum"))
         asyncio.ensure_future(_ack_grain_output(serial, topic_str, data))
         _mark_online(serial)
         asyncio.ensure_future(_check_and_fire_alerts(serial))

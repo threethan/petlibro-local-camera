@@ -256,6 +256,19 @@ function _fmt12h(h, m) {
   return `${h % 12 || 12}:${String(m).padStart(2, "0")} ${ampm}`;
 }
 const _WDAY_KEYS = ["time.wday_sun","time.wday_mon","time.wday_tue","time.wday_wed","time.wday_thu","time.wday_fri","time.wday_sat"];
+function lastFedLabel(timestamp) {
+  if (!timestamp) return "—";
+  const fedAt = new Date(timestamp * 1000);
+  if (Number.isNaN(fedAt.getTime())) return "—";
+
+  const elapsedHours = (Date.now() - fedAt.getTime()) / 3600000;
+  if (elapsedHours < 1) {
+    const elapsedMinutes = Math.max(0, Math.round(elapsedHours * 60));
+    return elapsedMinutes === 0 ? t("time.just_now") : t("time.ago_minutes", {n: elapsedMinutes});
+  }
+  if (elapsedHours < 24) return _fmt12h(fedAt.getHours(), fedAt.getMinutes());
+  return `${t(_WDAY_KEYS[fedAt.getDay()])} ${_fmt12h(fedAt.getHours(), fedAt.getMinutes())}`;
+}
 function nextMealLabel(plans) {
   if (!plans || !plans.length) return null;
   const enabled = plans.filter(p => p._enabled !== false);

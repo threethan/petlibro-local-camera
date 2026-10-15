@@ -6,13 +6,13 @@ function syncCameraTalkUI() {
   const button = document.getElementById("camera-talk-toggle");
   const status = document.getElementById("camera-talk-status");
   if (button) {
-    const label = _cameraTalk ? "Stop talking" : "Talk";
-    button.innerHTML = `<span class="material-icons" aria-hidden="true">${_cameraTalk ? "mic_off" : "mic"}</span> ${label}`;
+    const label = "Talk";
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">mic</span>';
     button.setAttribute("aria-label", label);
     button.title = label;
     button.setAttribute("aria-pressed", String(!!_cameraTalk));
   }
-  if (status) status.textContent = _cameraTalkMessage || "Use your microphone to talk to the feeder.";
+  if (status) status.textContent = _cameraTalkMessage;
 }
 
 function muteCameraForTalk() {
@@ -55,7 +55,7 @@ function stopCameraTalk(message = "") {
     if (sound) {
       sound.disabled = false;
       const muted = session.video?.muted !== false;
-      sound.textContent = muted ? "🔇" : "🔊";
+      sound.innerHTML = `<span class="material-icons" aria-hidden="true">${muted ? "volume_off" : "volume_up"}</span>`;
       sound.title = muted ? "Turn sound on" : "Mute camera sound";
       sound.setAttribute("aria-label", sound.title);
     }
@@ -114,7 +114,7 @@ async function startCameraTalk(serial) {
     const url = new URL(`${BASE}/api/devices/${encodeURIComponent(serial)}/camera/talk`, window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = session.socket = new WebSocket(url.href);
-    _cameraTalkMessage = "Microphone on · connecting to feeder…";
+    _cameraTalkMessage = "Microphone on · waiting for speaker…";
     syncCameraTalkUI();
     session.timeout = setTimeout(() => {
       if (current()) stopCameraTalk("The feeder did not become ready. Try again.");
@@ -135,7 +135,7 @@ async function startCameraTalk(serial) {
       };
       session.source.connect(session.node);
       session.node.connect(session.context.destination); // Worklet output is silence.
-      _cameraTalkMessage = "Microphone on · talking to feeder";
+      _cameraTalkMessage = "Microphone connected · talking to feeder";
       syncCameraTalkUI();
     };
     socket.onerror = () => { if (current()) stopCameraTalk("Could not connect to feeder talkback."); };

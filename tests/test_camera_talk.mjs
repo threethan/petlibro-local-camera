@@ -59,7 +59,9 @@ test('capture waits for ready, sends PCM, bounds backlog, and restores camera so
   assert.equal(h.video.muted, true);
   assert.equal(h.sockets[0].url, 'wss://example.test/prefix/api/devices/serial%20%2F%20one/camera/talk');
   assert.equal(h.nodes[0].connected, undefined);
+  assert.match(h.elements['camera-talk-status'].textContent, /waiting for speaker/i);
   h.sockets[0].onmessage({ data: '{"type":"ready"}' });
+  assert.match(h.elements['camera-talk-status'].textContent, /microphone connected/i);
   const pcm = new ArrayBuffer(4096);
   h.nodes[0].port.onmessage({ data: pcm });
   assert.equal(h.sockets[0].sent[0], pcm);

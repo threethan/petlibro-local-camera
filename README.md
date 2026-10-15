@@ -101,6 +101,7 @@ The full list, with details, is in [Features](docs/features.md). In short:
 - **Notifications:** in-app bell, Home Assistant notifications, email, and mobile push through the Home Assistant Companion app
 - **Clock care:** feeders have no clock that survives a reboot, so Petlibro Local notices a wrong clock and corrects it without skipping or repeating a feeding
 - **Home Assistant:** entities for everything, so automations, dashboards and voice assistants work. See [Home Assistant entities](docs/entities.md)
+- **Dashboard status card:** an optional HACS Community card for Granary and Smart Camera Feeders, with camera, food and feeding status plus Feed Now. Add it from **Add card → Community → Petlibro Local Status Card** after installing it as a HACS Dashboard repository; details are in [Home Assistant entities](docs/entities.md#petlibro-local-status-card)
 
 ---
 

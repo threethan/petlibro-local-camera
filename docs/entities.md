@@ -25,6 +25,7 @@ Petlibro Local automatically publishes MQTT discovery messages so Home Assistant
 | Entity | Type | Description |
 |--------|------|-------------|
 | Feed Now | Button | Dispenses one portion immediately |
+| Food Status | Sensor | `Adequate` when the feeder reports food remaining, `Low` when it reports low food |
 | Open Door | Button | Opens the feeder lid on demand |
 | Volume | Number (slider) | Speaker volume 0-100 |
 | LED Display | Switch | Turns the feeder's LED screen on or off, like the Show display switch in the app. It is the setting; with a custom LED Display hours window the screen can still be dark outside that window while this is on |
@@ -54,6 +55,7 @@ The Smart Camera Feeder exposes the Granary entities except Buttons Lock; its co
 | Entity | Type | Description |
 |--------|------|-------------|
 | Feed Now | Button | Dispenses one portion immediately |
+| Food Status | Sensor | `Adequate` when the feeder reports food remaining, `Low` when it reports low food |
 | Volume | Number (slider) | Speaker volume 0-100 |
 | Light | Switch | The feeder's indicator light |
 | Buttons Lock | Switch (config) | Locks the feeder's physical buttons (Granary only) |
@@ -87,6 +89,23 @@ Because the entities appear in HA like any other integration, they work everywhe
 - **History**: all sensor values are tracked in HA's history and statistics
 
 Entity IDs are stable and based on the device serial number, so they survive device renames and room reassignments.
+
+## Petlibro Local Status Card
+
+The optional **Petlibro Local Status Card** is a Community dashboard card for
+Granary and Smart Camera Feeders. It mirrors the app's status view: camera,
+food status, battery, last feed, next meal, and a **Feed now** action. Speaker
+and indicator-light controls are deliberately not included.
+
+Install `Petlibro Local Status Card` from HACS as a **Dashboard** repository,
+then refresh the browser. In a dashboard, select **Add card → Community →
+Petlibro Local Status Card**. Its visual editor asks for the feeder's **Feed
+Now** button and, optionally, its snapshot and Live Camera entities. When a
+Live Camera entity is selected, the last snapshot remains visible with a
+connecting spinner until the live image arrives. The card derives the other
+entities from the selected button, so it works even if you rename the feeder.
+
+The card needs Petlibro Local 2026.10.8 or later for the Food Status sensor.
 
 **Example: play an animation from an automation.** Use the standard `select.select_option` action on the Display Animation entity (its entity ID starts with your device's name), with the animation's name as the option:
 

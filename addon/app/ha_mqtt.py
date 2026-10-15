@@ -254,6 +254,12 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
 
     # ── Feeder ────────────────────────────────────────────────────────────
     elif device_type == "one_rfid":
+        entities.append(("sensor", "food_status", _e(serial, "food_status", b, {
+            "name":         "Food Status",
+            "state_topic":  state_topic(serial, "food_status"),
+            "icon":         "mdi:food-drumstick-outline",
+        })))
+
         entities.append(("sensor", "battery", _e(serial, "battery", b, {
             "name":                "Battery",
             "state_topic":         state_topic(serial, "battery"),
@@ -373,6 +379,12 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
 
     # ── Granary-style feeders (no RFID, no lid) ─────────────────────────────
     elif device_type in ("granary", "camera_feeder"):
+        entities.append(("sensor", "food_status", _e(serial, "food_status", b, {
+            "name":         "Food Status",
+            "state_topic":  state_topic(serial, "food_status"),
+            "icon":         "mdi:food-drumstick-outline",
+        })))
+
         entities.append(("sensor", "battery", _e(serial, "battery", b, {
             "name":                "Battery",
             "state_topic":         state_topic(serial, "battery"),
@@ -662,6 +674,13 @@ async def publish_state(client, serial: str, cfg: dict, state: dict, plans: list
 
     # Feeder
     elif device_type == "one_rfid":
+        if "surplusGrain" in state:
+            # The feeder reports True when food is sufficient and False when
+            # the grain level is low. A readable sensor state keeps the
+            # dashboard useful without requiring a template helper.
+            food_status = "Adequate" if state["surplusGrain"] else "Low"
+            await client.publish(state_topic(serial, "food_status"), food_status, retain=True)
+
         if "electricQuantity" in state:
             await client.publish(state_topic(serial, "battery"), str(state["electricQuantity"]), retain=True)
 
@@ -734,6 +753,10 @@ async def publish_state(client, serial: str, cfg: dict, state: dict, plans: list
 
     # Granary-style feeders (no RFID, no lid, no display).
     elif device_type in ("granary", "camera_feeder"):
+        if "surplusGrain" in state:
+            food_status = "Adequate" if state["surplusGrain"] else "Low"
+            await client.publish(state_topic(serial, "food_status"), food_status, retain=True)
+
         if "electricQuantity" in state:
             await client.publish(state_topic(serial, "battery"), str(state["electricQuantity"]), retain=True)
 

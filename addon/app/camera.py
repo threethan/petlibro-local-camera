@@ -26,6 +26,7 @@ _UID_RE = re.compile(r"^[!-~]{20}$")
 _http: aiohttp.ClientSession | None = None
 _bridge_process: asyncio.subprocess.Process | None = None
 _tasks: dict[str, asyncio.Task] = {}
+_snapshots: dict[str, bytes] = {}
 _registered_uids: dict[str, str] = {}
 _live_exposed: set[str] = set()
 _camera_available: dict[str, bool] = {}
@@ -46,6 +47,11 @@ def live_stream_available(serial: str) -> bool:
         and _bridge_process.returncode is None
         and _live_serial is None
     )
+
+
+def latest_snapshot(serial: str) -> bytes | None:
+    """Return the most recent JPEG emitted for HA, if one is available."""
+    return _snapshots.get(serial)
 
 
 def _vp8_transcode_source(raw_source: str) -> str:
@@ -74,7 +80,7 @@ async def live_frames(serial: str):
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-rtsp_transport", "tcp", "-i", _RTSP_URL.format(serial=serial),
-            "-an", "-vf", "fps=30,scale='min(960,iw)':-2", "-q:v", "7",
+            "-an", "-vf", "fps=8,scale='min(960,iw)':-2", "-q:v", "7",
             "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -83,6 +89,51 @@ async def live_frames(serial: str):
         stderr_task = asyncio.create_task(_drain_stderr(process.stderr, stderr_tail))
         async for frame in _jpeg_frames(process.stdout):
             yield frame
+        await process.wait()
+        if stderr_task:
+            await stderr_task
+            stderr_task = None
+        detail = stderr_tail.decode("utf-8", errors="replace").strip()[-1000:]
+        raise RuntimeError(f"FFmpeg stream ended ({process.returncode}): {detail or 'no diagnostic output'}")
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        if stderr_task:
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        _live_process = None
+        _live_serial = None
+
+
+async def live_video_chunks(serial: str):
+    """Yield fragmented H.264 MP4 for one temporary ingress viewer."""
+    global _live_serial, _live_process
+    if not live_stream_available(serial):
+        raise RuntimeError("Camera is not registered or the live viewer is busy")
+    _live_serial = serial
+    process = None
+    stderr_task = None
+    stderr_tail = bytearray()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-rtsp_transport", "tcp", "-i", _RTSP_URL.format(serial=serial),
+            "-an", "-vf", "fps=15,scale='min(960,iw)':-2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-level:v", "3.1", "-pix_fmt", "yuv420p",
+            "-g", "15", "-bf", "0", "-sc_threshold", "0",
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _live_process = process
+        stderr_task = asyncio.create_task(_drain_stderr(process.stderr, stderr_tail))
+        while chunk := await asyncio.wait_for(
+            process.stdout.read(64 * 1024), timeout=_STREAM_READ_TIMEOUT_SECS
+        ):
+            yield chunk
         await process.wait()
         if stderr_task:
             await stderr_task
@@ -507,6 +558,7 @@ async def stop_device(serial: str) -> None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     _registered_uids.pop(serial, None)
+    _snapshots.pop(serial, None)
     await _set_available(serial, False)
     try:
         import ha_mqtt
@@ -546,6 +598,7 @@ async def _snapshot_loop(serial: str) -> None:
                 stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
                 async for image in _jpeg_frames(process.stdout):
                     failures = 0
+                    _snapshots[serial] = image
                     try:
                         import devices
                         published = await devices.publish_camera_image(serial, image)

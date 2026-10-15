@@ -14,6 +14,7 @@ function switchTab(name) {
 
 // ── Refresh ───────────────────────────────────────────────────────────────
 function renderDeviceUpdates() {
+  syncBackgroundCameras();
   renderDevices();
   checkAlerts();
   if (_currentDevice) {
@@ -112,9 +113,7 @@ async function detectLanguage(availableLangs) {
     }
   }, { passive: false });
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { stopCameraTalk(); stopLiveCamera(); }
-  });
+  document.addEventListener("visibilitychange", handleCameraVisibilityChange);
 
   document.getElementById("btn-close-device").addEventListener("click", () => {
     stopCameraTalk();
@@ -268,6 +267,7 @@ async function detectLanguage(availableLangs) {
   renderDevices();
   renderPets();
   renderSettings();
+  syncBackgroundCameras();
   checkAlerts();
   checkMqttSetup();
   checkPetSetup();

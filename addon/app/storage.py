@@ -37,6 +37,8 @@ DEFAULT_SETTINGS = {
     "camera_snapshot_enabled": False,
     "camera_vp8_transcoding": False,
     "camera_auto_start_live_view": False,
+    "camera_preload_live_feeds": False,
+    "camera_force_landscape_mobile": False,
 }
 
 ALLOWED_SETTINGS = set(DEFAULT_SETTINGS.keys()) | {"feeder_timezone"}
@@ -187,6 +189,8 @@ def save_settings(updates: dict) -> dict:
                 "camera_vp8_transcoding",
                 "camera_snapshot_enabled",
                 "camera_auto_start_live_view",
+                "camera_preload_live_feeds",
+                "camera_force_landscape_mobile",
                 "device_ping_enabled",
             }:
                 if not isinstance(val, bool):

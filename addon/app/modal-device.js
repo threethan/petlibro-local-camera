@@ -5,6 +5,10 @@ let _liveCameraSerial = null;
 let _liveCameraBridge = null;
 let _liveCameraPowerOwner = null;
 let _liveCameraGeneration = 0;
+let _liveCameraRecording = null;
+let _liveCameraFullscreenFallback = false;
+let _liveCameraBackgroundSerial = null;
+let _cameraHiddenTimer = null;
 const _cameraPowerOwners = new Map();
 let _liveCameraPowerRequest = Promise.resolve();
 function preferVP8(transceiver) {
@@ -41,17 +45,27 @@ function releaseCameraPower(serial, owner) {
 }
 function stopLiveCamera() {
   _liveCameraGeneration++;
+  stopLiveCameraRecording();
+  exitLiveCameraFullscreen();
+  if (_liveCameraBackgroundSerial) {
+    const serial = _liveCameraBackgroundSerial;
+    _liveCameraBackgroundSerial = null;
+    detachBackgroundCamera(serial);
+  }
   const powerOwner = _liveCameraPowerOwner;
   _liveCameraPowerOwner = null;
   closeLiveCameraWebrtc();
-  if (_liveCameraBridge) { _liveCameraBridge.src = ""; _liveCameraBridge.remove(); _liveCameraBridge = null; }
+  if (_liveCameraBridge) { _liveCameraBridge.close(); _liveCameraBridge = null; }
   const frame = document.getElementById("camera-live-frame");
   frame?.classList.remove("is-live");
+  frame?.classList.remove("is-connecting");
   frame?.querySelector("video")?.remove();
   const placeholder = document.getElementById("camera-live-placeholder");
   if (placeholder) placeholder.style.display = "";
+  const snapshotImage = document.getElementById("camera-live-snapshot-image");
+  if (snapshotImage?.complete && snapshotImage.naturalWidth) snapshotImage.hidden = false;
   const start = document.getElementById("camera-live-start");
-  if (start) { start.textContent = "Click to start live view"; start.disabled = false; start.hidden = false; }
+  if (start) { start.textContent = "Start live view"; start.disabled = false; start.hidden = false; }
   const stop = document.getElementById("camera-live-stop");
   if (stop) stop.hidden = true;
   const sound = document.getElementById("camera-live-sound");
@@ -62,6 +76,123 @@ function stopLiveCamera() {
   if (vp8Hint) vp8Hint.hidden = true;
   if (powerOwner) releaseCameraPower(powerOwner.serial, powerOwner);
 }
+function downloadLiveCameraBlob(blob, extension) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `petlibro-camera-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+function stopLiveCameraRecording() {
+  const recording = _liveCameraRecording;
+  if (!recording) return;
+  _liveCameraRecording = null;
+  if (recording.timer) clearInterval(recording.timer);
+  if (recording.recorder.state !== "inactive") recording.recorder.stop();
+  const button = document.getElementById("camera-live-record");
+  if (button) {
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">videocam</span>';
+    button.title = "Record video";
+    button.setAttribute("aria-label", button.title);
+    button.setAttribute("aria-pressed", "false");
+  }
+  const status = document.getElementById("camera-live-status");
+  if (status?.isConnected) status.textContent = "Saving video…";
+}
+function exitLiveCameraFullscreen() {
+  const frame = document.getElementById("camera-live-frame");
+  const fullscreenFrame = document.fullscreenElement?.id === "camera-live-frame" ? document.fullscreenElement : null;
+  if (fullscreenFrame) document.exitFullscreen?.().catch(() => {});
+  fullscreenFrame?.classList.remove("is-landscape-rotated");
+  frame?.classList.remove("is-fullscreen-fallback", "is-landscape-rotated");
+  _liveCameraFullscreenFallback = false;
+  const button = document.getElementById("camera-live-fullscreen");
+  if (button) {
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">fullscreen</span>';
+    button.title = "Fullscreen";
+    button.setAttribute("aria-label", button.title);
+  }
+}
+function isMobileCameraClient() {
+  const client = globalThis.navigator;
+  return client?.userAgentData?.mobile === true
+    || /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(client?.userAgent || "")
+    || (client?.platform === "MacIntel" && client?.maxTouchPoints > 1)
+    || !!(window.externalApp || window.externalAppV2 || window.webkit?.messageHandlers?.externalBus)
+    || (client?.maxTouchPoints > 0 && window.matchMedia?.("(pointer: coarse)").matches
+      && window.screen?.width < window.screen?.height && window.screen.width <= 1280);
+}
+function useMobileLandscapeFallback() {
+  return _settings.camera_force_landscape_mobile === true && isMobileCameraClient();
+}
+async function enterLiveCameraFullscreen(frame) {
+  if (!useMobileLandscapeFallback()) {
+    try {
+      if (!frame.requestFullscreen) throw new Error("Fullscreen API unavailable");
+      await frame.requestFullscreen();
+      return;
+    } catch { /* Embedded browsers may reject the Fullscreen API. */ }
+  }
+  _liveCameraFullscreenFallback = true;
+  frame.classList.add("is-fullscreen-fallback");
+}
+function syncLiveCameraFullscreen() {
+  const frame = document.getElementById("camera-live-frame");
+  const active = !!frame && (document.fullscreenElement === frame || _liveCameraFullscreenFallback);
+  const portrait = window.matchMedia?.("(orientation: portrait)").matches ?? window.innerHeight > window.innerWidth;
+  if (frame) frame.classList.toggle("is-landscape-rotated", active && useMobileLandscapeFallback() && portrait);
+  const button = document.getElementById("camera-live-fullscreen");
+  if (button) {
+    button.innerHTML = `<span class="material-icons" aria-hidden="true">${active ? "fullscreen_exit" : "fullscreen"}</span>`;
+    button.title = active ? "Exit fullscreen" : "Fullscreen";
+    button.setAttribute("aria-label", button.title);
+  }
+}
+function resumeLiveCameraPlayback() {
+  const frame = document.getElementById("camera-live-frame");
+  const video = frame?.querySelector("video");
+  if (!video) return;
+  // Moving the frame into fullscreen must not replace the peer connection or
+  // its MediaStream. Some mobile browsers pause (and occasionally detach) a
+  // video element as its fullscreen container changes.
+  if (_liveCameraPc && _liveCameraPc.connectionState !== "closed" && _liveCameraPc.connectionState !== "failed") {
+    const stream = _liveCameraPc.getReceivers()
+      .map(receiver => receiver.track)
+      .filter(Boolean)
+      .reduce((mediaStream, track) => {
+        if (!mediaStream.getTracks().includes(track)) mediaStream.addTrack(track);
+        return mediaStream;
+      }, video.srcObject instanceof MediaStream ? video.srcObject : new MediaStream());
+    if (stream.getTracks().length && video.srcObject !== stream) video.srcObject = stream;
+  }
+  video.play().catch(() => {});
+}
+function handleCameraVisibilityChange() {
+  clearTimeout(_cameraHiddenTimer);
+  _cameraHiddenTimer = null;
+  if (!document.hidden) {
+    resumeLiveCameraPlayback();
+    return;
+  }
+  // Mobile fullscreen transitions can briefly mark the page as hidden.
+  // Release the camera only when the page remains in the background.
+  _cameraHiddenTimer = setTimeout(() => {
+    _cameraHiddenTimer = null;
+    if (document.hidden) { stopCameraTalk(); stopLiveCamera(); }
+  }, 2000);
+}
+document.addEventListener?.("fullscreenchange", () => {
+  syncLiveCameraFullscreen();
+  resumeLiveCameraPlayback();
+});
+globalThis.window?.addEventListener("orientationchange", syncLiveCameraFullscreen);
+globalThis.window?.addEventListener("resize", syncLiveCameraFullscreen);
+document.addEventListener?.("keydown", event => {
+  if (event.key === "Escape" && _liveCameraFullscreenFallback) exitLiveCameraFullscreen();
+});
 function closeLiveCameraWebrtc() {
   if (_liveCameraPc) { _liveCameraPc.close(); _liveCameraPc = null; }
   if (_liveCameraSession) {
@@ -69,6 +200,97 @@ function closeLiveCameraWebrtc() {
     _liveCameraSession = null;
   }
   _liveCameraSerial = null;
+}
+function openLiveCameraVideoBridge(serial, frame, onEnd) {
+  const mimeType = 'video/mp4; codecs="avc1.42C01F"';
+  if (!window.MediaSource || !MediaSource.isTypeSupported(mimeType)) {
+    throw new Error("This browser cannot play the camera video bridge.");
+  }
+  const video = document.createElement("video");
+  video.autoplay = true; video.playsInline = true; video.muted = true;
+  video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain";
+  const source = new MediaSource();
+  const url = URL.createObjectURL(source);
+  const controller = new AbortController();
+  let reader = null;
+  let settled = false;
+  let resolveReady;
+  const ready = new Promise(resolve => { resolveReady = resolve; });
+  const finish = result => {
+    if (settled) {
+      if (!result && !controller.signal.aborted) onEnd();
+      return;
+    }
+    settled = true;
+    clearTimeout(timer);
+    resolveReady(result);
+  };
+  const close = () => {
+    controller.abort();
+    reader?.cancel().catch(() => {});
+    video.onloadeddata = null;
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    video.remove();
+    URL.revokeObjectURL(url);
+    finish(false);
+  };
+  const timer = setTimeout(() => finish(false), 20000);
+  video.onloadeddata = () => { video.play().catch(() => {}); finish(true); };
+  frame.prepend(video);
+  video.src = url;
+  const append = (buffer, bytes) => new Promise((resolve, reject) => {
+    const done = () => { buffer.removeEventListener("error", failed); resolve(); };
+    const failed = () => { buffer.removeEventListener("updateend", done); reject(new Error("Camera video decode failed")); };
+    buffer.addEventListener("updateend", done, { once: true });
+    buffer.addEventListener("error", failed, { once: true });
+    try { buffer.appendBuffer(bytes); }
+    catch (error) {
+      buffer.removeEventListener("updateend", done);
+      buffer.removeEventListener("error", failed);
+      reject(error);
+    }
+  });
+  (async () => {
+    await new Promise((resolve, reject) => {
+      if (source.readyState === "open") return resolve();
+      const opened = () => { cleanup(); resolve(); };
+      const failed = () => { cleanup(); reject(new Error("Camera video source failed")); };
+      const aborted = () => { cleanup(); resolve(); };
+      const cleanup = () => {
+        source.removeEventListener("sourceopen", opened);
+        source.removeEventListener("error", failed);
+        controller.signal.removeEventListener("abort", aborted);
+      };
+      source.addEventListener("sourceopen", opened);
+      source.addEventListener("error", failed);
+      controller.signal.addEventListener("abort", aborted, { once: true });
+    });
+    if (controller.signal.aborted) return;
+    const buffer = source.addSourceBuffer(mimeType);
+    const response = await fetch(`${BASE}/api/devices/${encodeURIComponent(serial)}/camera/live.mp4`, { signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error(`Video bridge returned HTTP ${response.status}`);
+    reader = response.body.getReader();
+    while (!controller.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      await append(buffer, value);
+      if (buffer.buffered.length) {
+        const end = buffer.buffered.end(buffer.buffered.length - 1);
+        if (end - video.currentTime > 4) video.currentTime = Math.max(0, end - 0.5);
+        if (video.currentTime > 20 && buffer.buffered.start(0) < video.currentTime - 10) {
+          await new Promise((resolve, reject) => {
+            buffer.addEventListener("updateend", resolve, { once: true });
+            try { buffer.remove(buffer.buffered.start(0), video.currentTime - 10); }
+            catch (error) { reject(error); }
+          });
+        }
+      }
+    }
+    if (!controller.signal.aborted) finish(false);
+  })().catch(() => { if (!controller.signal.aborted) finish(false); });
+  return { video, ready, close };
 }
 function openDeviceModal(device) {
   stopCameraTalk();
@@ -162,6 +384,11 @@ function updateDeviceModalStatus(device) {
 
   const wasOnline = _currentDevice.online;
   _currentDevice = device;
+  const feedNow = document.getElementById("btn-feed-now");
+  if (feedNow) {
+    feedNow.disabled = !!device.manual_feed_pending;
+    feedNow.textContent = device.manual_feed_pending ? t("overview.waiting_for_feed") : t("overview.feed_now");
+  }
   const badge = document.getElementById("detail-status-badge");
   badge.textContent = device.online ? t("device.online") : t("device.offline");
   badge.className = `status-badge ${device.online ? "online" : "offline"}`;
@@ -249,27 +476,31 @@ function noSdCardDetected(device) {
 function buildCameraStorageStatus(device) {
   const number = value => (typeof value === "number" && Number.isInteger(value) && value >= 0) || (typeof value === "string" && /^\d{1,20}$/.test(value)) ? Number(value) : null;
   const total = number(device.sdCardTotalCapacity), used = number(device.sdCardUsedCapacity);
-  const mb = value => value === null ? "Unknown" : `${value} MB`;
-  const free = total !== null && used !== null && used <= total ? total - used : null;
-  return `<section class="camera-settings-section"><header class="camera-settings-header"><h3>SD card</h3></header><div class="camera-settings-body">
-    <p class="form-hint">Last reported by the feeder.</p>
-    <div class="form-row"><span>Filesystem</span><strong>${escHtml(typeof device.sdCardFileSystem === "string" ? device.sdCardFileSystem : "Unknown")}</strong></div>
-    <div class="form-row"><span>Total / Used / Free</span><strong>${escHtml(`${mb(total)} / ${mb(used)} / ${mb(free)}`)}</strong></div>
-    <div class="form-row"><span>Recording capability</span><strong>${device.enableVideoRecord === true ? "Supported" : device.enableVideoRecord === false ? "Unavailable" : "Unknown"}</strong></div>
-  </div></section>`;
+  const capacity = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GB` : `${value} MB`;
+  const hasUsage = total !== null && total > 0 && used !== null && used <= total;
+  const filesystem = typeof device.sdCardFileSystem === "string" ? device.sdCardFileSystem.trim() : "";
+  return `<section class="sd-card-panel" aria-label="SD card storage">
+    <div class="sd-card-top">
+      <span class="sd-card-title"><span class="material-icons" aria-hidden="true">sd_card</span>SD card</span>
+      <span class="sd-card-capacity">${total > 0 ? capacity(total) : "Capacity unknown"}</span>
+    </div>
+    ${hasUsage ? `<div class="sd-card-summary"><strong>${capacity(total - used)} free</strong><span>${capacity(used)} used</span></div>
+      <div class="sd-card-track" role="progressbar" aria-label="SD card space used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(used / total * 100)}"><div class="sd-card-fill" style="width:${used / total * 100}%"></div></div>` : ""}
+    ${filesystem ? `<div class="sd-card-meta">Filesystem: ${escHtml(filesystem)}</div>` : ""}
+  </section>`;
 }
 
 function buildCameraSettingsTab(device, category = "all") {
   const row = (label, field, value, type = "text", extra = "") => `<div class="form-row"><label class="form-label">${label}</label><input class="form-input" data-camera-setting="${field}" type="${type}" value="${escHtml(String(value ?? ""))}" ${extra}></div>`;
   const choice = (label, field, value, options) => `<div class="form-row"><label class="form-label">${label}</label><select class="form-select" data-camera-setting="${field}">${options.map(([v, text]) => `<option value="${v}" ${String(value) === String(v) ? "selected" : ""}>${text}</option>`).join("")}</select></div>`;
   const section = (title, field, enabled, content, options = {}) => `<section class="camera-settings-section">
-    <header class="camera-settings-header"><h3>${title}</h3><button type="button" class="toggle-switch ${enabled ? "sw-on" : "sw-off"}" data-camera-setting="${field}" data-toggle="true" aria-label="Enable ${title}" ${options.toggleHidden ? "hidden" : ""}></button></header>
+    <header class="camera-settings-header"><h3>${title}</h3><button type="button" class="toggle-switch ${options.smallToggle ? "is-small " : ""}${enabled ? "sw-on" : "sw-off"}" data-camera-setting="${field}" data-toggle="true" aria-label="Enable ${title}" ${options.toggleHidden ? "hidden" : ""}></button></header>
     <div class="camera-settings-body" ${enabled || options.bodyOpen ? "" : "hidden"}>${content}</div>
     ${options.trailing || ""}
   </section>`;
   const schedule = (name, agingField, agingType, startField, startValue, endField, endValue, leadingControl = "", trailingControl = "") => {
     const scheduled = Number(agingType ?? 1) === 2;
-    return `<div class="camera-sound-controls${name === "camera" ? " camera-schedule-controls" : ""}">${leadingControl}<label class="small-toggle-row"><span>Schedule</span><input class="small-toggle" type="checkbox" data-camera-setting="${agingField}" data-toggle-kind="all-day" ${scheduled ? "checked" : ""}></label>${trailingControl}</div>
+    return `<div class="camera-sound-controls${name === "camera" ? " camera-schedule-controls" : ""}${name === "indicators" ? " indicator-schedule-controls" : ""}">${leadingControl}<label class="small-toggle-row"><span>Schedule</span><input class="small-toggle" type="checkbox" data-camera-setting="${agingField}" data-toggle-kind="all-day" ${scheduled ? "checked" : ""}></label>${trailingControl}</div>
       <div class="camera-time-grid" data-schedule-times="${name}" ${scheduled ? "" : "hidden"}>
         ${row("", startField, startValue, "time")}<span class="camera-time-separator">to</span>${row("", endField, endValue, "time")}
       </div>`;
@@ -281,18 +512,18 @@ function buildCameraSettingsTab(device, category = "all") {
   const powerWithLiveView = device.camera_power_with_live_view === true;
   const powerWithLiveViewControl = `<div class="camera-ha-expose-row">
       <div class="camera-ha-expose-copy">
-        <span class="camera-ha-expose-label">${t("settings.camera_power_with_live_view")}</span>
+        <label class="camera-ha-expose-label" for="camera-power-with-live-view">${t("settings.camera_power_with_live_view")}</label>
         <p class="camera-ha-expose-hint">${t("settings.camera_power_with_live_view_hint")}</p>
       </div>
-      <button type="button" id="camera-power-with-live-view" role="switch" aria-checked="${powerWithLiveView}" aria-label="${t("settings.camera_power_with_live_view")}" class="toggle-switch camera-ha-expose-toggle ${powerWithLiveView ? "sw-on" : "sw-off"}"></button>
+      <input type="checkbox" id="camera-power-with-live-view" class="camera-ha-checkbox" ${powerWithLiveView ? "checked" : ""}>
     </div>`;
   const exposureControl = `<div class="camera-ha-expose-row" id="camera-ha-expose-row" ${powerWithLiveView ? "hidden" : ""}>
       <div class="camera-ha-expose-copy">
-        <span class="camera-ha-expose-label">Live Camera in Home Assistant</span>
+        <label class="camera-ha-expose-label" for="camera-ha-expose">Live Camera in Home Assistant</label>
         <p class="camera-ha-expose-hint">Adds or removes a separate live camera entity in Home Assistant. Can use more CPU. The snapshot camera is available either way.</p>
         <span id="camera-ha-expose-status" role="status" class="camera-ha-expose-status"></span>
       </div>
-      <button type="button" id="camera-ha-expose" role="switch" aria-checked="${device.live_camera_exposed === true}" aria-label="Live Camera in Home Assistant" class="toggle-switch camera-ha-expose-toggle ${device.live_camera_exposed === true ? "sw-on" : "sw-off"}"></button>
+      <input type="checkbox" id="camera-ha-expose" class="camera-ha-checkbox" ${device.live_camera_exposed === true ? "checked" : ""}>
     </div>`;
   return `${show("video") ? section("Camera", "cameraSwitch", device.cameraSwitch !== false, `
       <div class="camera-settings-grid">${choice(t("settings.camera_resolution"), "resolution", device.resolution || "P1080", [["P1080","1080p"],["P720","720p"]])}${choice(t("settings.camera_night_vision"), "nightVision", device.nightVision || "OPEN", [["AUTOMATIC","Automatic"],["OPEN","Always on"],["CLOSE","Off"]])}</div>
@@ -301,18 +532,18 @@ function buildCameraSettingsTab(device, category = "all") {
     ${show("indicators") ? section("Indicator lights", "lightSwitch", device.lightSwitch !== false, `
       ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
     `) : ""}
-    ${show("recording") ? noSdCardDetected(device) ? `<p class="form-hint">No SD Card Detected</p>` : buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
+    ${show("recording") ? noSdCardDetected(device) ? `<div class="sd-card-empty"><span class="material-icons" aria-hidden="true">sd_card</span>No SD Card Detected</div>` : buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
       <p class="form-hint">The feeder saves video to its SD card. Motion recording also requires Motion Detection to be enabled with overlapping hours.</p>
       ${choice("Recording mode", "videoRecordMode", device.videoRecordMode || "CONTINUOUS", [["CONTINUOUS", "Continuous"], ["MOTION_DETECTION", "Motion detection"]])}
       ${schedule("recording", "videoRecordAgingType", device.videoRecordAgingType, "videoRecordStartTime", device.videoRecordStartTime || utcToLocalOrEmpty(device.videoRecordStartTimeUtc) || "00:00", "videoRecordEndTime", device.videoRecordEndTime || utcToLocalOrEmpty(device.videoRecordEndTimeUtc) || "23:59")}
-    `) : ""}
-    ${show("feeding-video") ? section("Feeding video", "feedingVideoSwitch", device.feedingVideoSwitch === true, `
+    `, { smallToggle: true }) : ""}
+    ${show("feeding-video") && !noSdCardDetected(device) ? section("Feeding video", "feedingVideoSwitch", device.feedingVideoSwitch === true, `
       <label class="small-toggle-row"><span>Record scheduled feeding</span><input class="small-toggle" type="checkbox" data-camera-setting="enableVideoStartFeedingPlan" ${device.enableVideoStartFeedingPlan === true ? "checked" : ""}></label>
       ${row("Minutes before scheduled feeding", "beforeFeedingPlanTime", device.beforeFeedingPlanTime ?? 1, "number", 'min="1" max="5" step="1"')}
       ${row("Automatic recording duration (minutes)", "automaticRecording", device.automaticRecording ?? 1, "number", 'min="1" max="5" step="1"')}
       <label class="small-toggle-row"><span>Record after manual feeding</span><input class="small-toggle" type="checkbox" data-camera-setting="enableVideoAfterManualFeeding" ${device.enableVideoAfterManualFeeding === true ? "checked" : ""}></label>
       ${row("Minutes after manual feeding", "afterManualFeedingTime", device.afterManualFeedingTime ?? 1, "number", 'min="1" max="5" step="1"')}
-    `) : ""}
+    `, { smallToggle: true }) : ""}
     ${show("sound") ? section(t("settings.sound_tab"), "soundSwitch", device.soundSwitch !== false, `
       ${schedule("sound", "soundAgingType", device.soundAgingType, "soundStartTime", device.sound_start_local || "00:00", "soundEndTime", device.sound_end_local || "23:59", `
         <div class="camera-volume-control">
@@ -333,22 +564,19 @@ function buildCameraSettingsTab(device, category = "all") {
 
 // ── Overview tab ──────────────────────────────────────────────────────────
 function feedTimingValues(device) {
-  const fedAt = device.last_fed_ts ? new Date(device.last_fed_ts * 1000) : null;
-  const lastFed = fedAt && !Number.isNaN(fedAt.getTime())
-    ? fedAt.toLocaleString(undefined, {dateStyle: "medium", timeStyle: "short"})
-    : "—";
+  const lastFed = lastFedLabel(device.last_fed_ts);
   const nextFeed = device.schedules_paused ? null : nextMealLabel(device.feeding_plans);
   return {lastFed, nextFeed: nextFeed || "—"};
 }
 
 function buildFeedTimingStats(device) {
   const {lastFed, nextFeed} = feedTimingValues(device);
-  return `<div class="detail-stats" style="margin-bottom:12px">
-    <div class="detail-stat" style="padding:8px 14px">
+  return `<div class="detail-stats">
+    <div class="ha-card" style="padding:8px 14px">
       <div class="detail-stat-label">${t("card.last_fed")}</div>
       <div class="detail-stat-value" id="detail-last-fed">${escHtml(lastFed)}</div>
     </div>
-    <div class="detail-stat" style="padding:8px 14px">
+    <div class="ha-card" style="padding:8px 14px">
       <div class="detail-stat-label">${t("overview.next_feed")}</div>
       <div class="detail-stat-value" id="detail-next-feed">${escHtml(nextFeed)}</div>
     </div>
@@ -361,13 +589,13 @@ function buildOverviewTab(device) {
   const cleanDays = cleaningDaysRemaining(device);
   const cleanClass = cleanDays != null && cleanDays < 1 ? "danger" : "";
   const intakeHtml = device.intake_today_grams > 0
-    ? `<div class="detail-stat">
+    ? `<div class="ha-card">
         <div class="detail-stat-label">${t("overview.intake_today")}</div>
         <div class="detail-stat-value accent">${escHtml(fmtWater(device.intake_today_grams))}</div>
       </div>`
     : "";
   const cleanHtml = cleanDays != null
-    ? `<div class="detail-stat">
+    ? `<div class="ha-card">
         <div class="detail-stat-label">${t("overview.next_clean")}</div>
         <div class="detail-stat-value ${cleanClass}">${escHtml(fmtDays(Math.max(0, cleanDays)))}</div>
       </div>`
@@ -409,35 +637,36 @@ function buildOverviewTab(device) {
       ? `${device.electricQuantity}% (${powerIsAC ? t("power.ac") : t("power.battery")})`
       : (powerIsAC ? t("power.ac") : "—");
     return `<div class="detail-stats">
-      <div class="detail-stat" style="padding:8px 14px">
+      <div class="ha-card" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.food_level")}</div>
         <div class="detail-stat-value ${foodClass}">${foodLabel}</div>
       </div>
-      <div class="detail-stat" style="padding:8px 14px">
+      <div class="ha-card" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.battery")}</div>
         <div class="detail-stat-value ${battClass}">${battPct}</div>
       </div>
     </div>
-    <div style="margin-top:16px">
-      <div class="tab-section-heading">${t("overview.controls")}</div>
+    <div>
       ${buildFeedTimingStats(device)}
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-        <label style="white-space:nowrap;font-size:13px;color:var(--pl-subtext)">${t("overview.portions")}</label>
-        <select class="form-input" id="feeder-portions" style="width:110px">
+      <div class="feed-now-controls">
+        <div class="feed-amount-control">
+          <label>${t("overview.portions")}</label>
+          <select class="form-input" id="feeder-portions">
           <option value="1" selected>${fmtPortions(1, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="2">${fmtPortions(2, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="3">${fmtPortions(3, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="4">${fmtPortions(4, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="5">${fmtPortions(5, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-        </select>
-        <button class="btn-primary" id="btn-feed-now" style="flex:1">${t("overview.feed_now")}</button>
+          </select>
+        </div>
+        <button class="btn-primary" id="btn-feed-now">${t("overview.feed_now")}</button>
       </div>
       <div style="display:flex;gap:8px;margin-top:8px">
         <button class="btn-secondary" id="btn-open-lid" style="flex:1">${t("overview.open_lid")}</button>
         <button class="btn-secondary" id="btn-close-lid" style="flex:1">${t("overview.close_lid")}</button>
       </div>
     </div>
-    <div style="margin-top:16px">
+    <div style="margin-top:12px">
       <div class="form-row">
         <label class="form-label">${t("overview.lid_mode")}</label>
         <select class="form-input" id="feeder-cover-open-mode">
@@ -499,46 +728,53 @@ function buildOverviewTab(device) {
       && (/chrome/i.test(brands) || /Chrome\//.test(ua))
       && !/Edg|OPR|Opera/i.test(`${brands} ${ua}`);
     const liveCameraHtml = device.device_type === "camera_feeder" ? `<section class="overview-live-camera">
-      ${isWindowsChrome ? `<div class="detail-stat" id="camera-windows-vp8-hint" hidden>${t("camera.windows_vp8_hint")}</div>` : ""}
+      ${isWindowsChrome ? `<div class="ha-card" style="padding:12px; margin-bottom:12px" id="camera-windows-vp8-hint" hidden>${t("camera.windows_vp8_hint")}</div>` : ""}
       <div class="tab-section-heading">Live camera</div>
       <div class="overview-live-camera-frame" id="camera-live-frame">
-        <button type="button" class="overview-live-camera-start" id="camera-live-start">Click to start live view</button>
+        <img class="overview-live-camera-snapshot" id="camera-live-snapshot-image" src="${BASE}/api/devices/${encodeURIComponent(device.serial)}/camera/snapshot" alt="Latest camera snapshot" hidden>
+        <button type="button" class="overview-live-camera-start" id="camera-live-start">Start live view</button>
         <div class="overview-live-camera-controls" id="camera-live-controls" aria-label="Live camera settings">
-          <label title="Resolution"><span class="material-icons" aria-hidden="true">high_quality</span><select id="camera-live-resolution" aria-label="Resolution"><option value="P1080">1080p</option><option value="P720">720p</option></select></label>
-          <label title="Night vision"><span class="material-icons" aria-hidden="true">nightlight</span><select id="camera-live-night-vision" aria-label="Night vision"><option value="AUTOMATIC">Auto</option><option value="OPEN">On</option><option value="CLOSE">Off</option></select></label>
-          <button type="button" class="overview-live-camera-sound" id="camera-live-sound" aria-label="Turn camera sound on" title="Turn sound on" hidden><span class="material-icons" aria-hidden="true">volume_off</span></button>
+          <label class="overview-live-camera-select-chip" title="Resolution"><span class="material-icons" aria-hidden="true">high_quality</span><span class="camera-control-value">1080p</span><select id="camera-live-resolution" aria-label="Resolution"><option value="P1080">1080p</option><option value="P720">720p</option></select></label>
+          <label class="overview-live-camera-select-chip" title="Night vision"><span class="material-icons" aria-hidden="true">nightlight</span><span class="camera-control-value">Auto</span><select id="camera-live-night-vision" aria-label="Night vision"><option value="AUTOMATIC">Auto</option><option value="OPEN">On</option><option value="CLOSE">Off</option></select></label>
+          <button type="button" class="overview-live-camera-action overview-live-camera-talk-action" id="camera-talk-toggle" aria-label="Talk" title="Talk" aria-pressed="false"><span class="material-icons" aria-hidden="true">mic</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-snapshot" aria-label="Download snapshot" title="Download snapshot"><span class="material-icons" aria-hidden="true">photo_camera</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-record" aria-label="Record video" aria-pressed="false" title="Record video"><span class="material-icons" aria-hidden="true">videocam</span></button>
           <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
         </div>
-        <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
-      </div>
-      <div class="overview-camera-talk">
-        <button type="button" class="btn-secondary" id="camera-talk-toggle" aria-label="Talk" aria-pressed="false"><span class="material-icons" aria-hidden="true">mic</span> Talk</button>
-        <span id="camera-talk-status" role="status" aria-live="polite"></span>
+        <div class="overview-live-camera-top-controls" aria-label="Video view controls">
+          <button type="button" class="overview-live-camera-sound" id="camera-live-sound" aria-label="Turn camera sound on" title="Turn sound on" hidden><span class="material-icons" aria-hidden="true">volume_off</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-fullscreen" aria-label="Fullscreen" title="Fullscreen"><span class="material-icons" aria-hidden="true">fullscreen</span></button>
+        </div>
+        <div class="overview-live-camera-status-group">
+          <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
+          <span id="camera-talk-status" role="status" aria-live="polite"></span>
+        </div>
       </div>
     </section>` : "";
     return `${liveCameraHtml}<div class="detail-stats">
-      <div class="detail-stat" style="padding:8px 14px">
+      <div class="ha-card" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.food_level")}</div>
         <div class="detail-stat-value ${foodClass}">${foodLabel}</div>
       </div>
-      <div class="detail-stat" style="padding:8px 14px">
+      <div class="ha-card" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.battery")}</div>
         <div class="detail-stat-value ${battClass}">${battLabel}</div>
       </div>
     </div>
-    <div style="margin-top:16px">
-      <div class="tab-section-heading">${t("overview.controls")}</div>
+    <div>
       ${buildFeedTimingStats(device)}
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-        <label style="white-space:nowrap;font-size:13px;color:var(--pl-subtext)">${t("overview.portions")}</label>
-        <select class="form-input" id="feeder-portions" style="width:110px">
+      <div class="feed-now-controls">
+        <div class="feed-amount-control">
+          <label>${t("overview.portions")}</label>
+          <select class="form-input" id="feeder-portions">
           <option value="1" selected>${fmtPortions(1, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="2">${fmtPortions(2, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="3">${fmtPortions(3, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="4">${fmtPortions(4, device.calibrated_grams_per_portion, device.feed_unit)}</option>
           <option value="5">${fmtPortions(5, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-        </select>
-        <button class="btn-primary" id="btn-feed-now" style="flex:1">${t("overview.feed_now")}</button>
+          </select>
+        </div>
+        <button class="btn-primary" id="btn-feed-now">${t("overview.feed_now")}</button>
       </div>
     </div>
     ${device.device_type !== "camera_feeder" ? `<div class="toggle-list" style="margin-top:16px">
@@ -555,11 +791,11 @@ function buildOverviewTab(device) {
   }
 
   return `<div class="detail-stats">
-    <div class="detail-stat">
+    <div class="ha-card">
       <div class="detail-stat-label">${t("overview.water_level")}</div>
       <div class="detail-stat-value accent">${escHtml(fmtWater(device.currentWeight ?? null))}</div>
     </div>
-    <div class="detail-stat">
+    <div class="ha-card">
       <div class="detail-stat-label">${t("overview.filter_due")}</div>
       <div class="detail-stat-value ${filterClass}">${escHtml(fmtDays(filterDays))}</div>
     </div>
@@ -747,6 +983,7 @@ function buildMaintenanceTab(device) {
     const bCol  = bowlDays != null && bowlDays <= 0 ? "var(--pl-danger)" : "var(--pl-accent)";
     const hCol  = housDays != null && housDays <= 0 ? "var(--pl-danger)" : "var(--pl-accent)";
     return `
+    <p class="form-hint" style="margin:0 0 18px">${t("maint.feeder_local_only")}</p>
     <div class="tab-section-heading">${t("maint.food_tank")}</div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
       <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.next_refill_in")}</span>
@@ -756,9 +993,9 @@ function buildMaintenanceTab(device) {
         style="max-width:90px;color:${fdCol}">
     </div>
     <label class="form-label">${t("maint.refill_every")}</label>
-    <div style="display:flex;gap:8px;margin-bottom:18px">
-      <input class="form-input" id="maint-food-refill-interval" type="number" min="1" max="365" value="${device.food_refill_interval_days ?? 14}" style="flex:1">
-      <button class="btn-secondary" id="btn-record-food-refill" style="flex-shrink:0">${t("maint.record_food_refill")}</button>
+    <div class="maint-action-row">
+      <input class="form-input" id="maint-food-refill-interval" type="number" min="1" max="365" value="${device.food_refill_interval_days ?? 14}">
+      <button class="btn-secondary" id="btn-record-food-refill">${t("maint.record_food_refill")}</button>
     </div>
 
     <div class="tab-section-heading">${t("maint.desiccant")}</div>
@@ -770,9 +1007,9 @@ function buildMaintenanceTab(device) {
         style="max-width:90px;color:${dCol}">
     </div>
     <label class="form-label">${t("maint.desiccant_replace_every")}</label>
-    <div style="display:flex;gap:8px;margin-bottom:18px">
-      <input class="form-input" id="maint-desiccant-life" type="number" min="1" max="365" value="${device.desiccant_life_days ?? 14}" style="flex:1">
-      <button class="btn-secondary" id="btn-reset-desiccant" style="flex-shrink:0">${t("maint.reset_desiccant")}</button>
+    <div class="maint-action-row">
+      <input class="form-input" id="maint-desiccant-life" type="number" min="1" max="365" value="${device.desiccant_life_days ?? 14}">
+      <button class="btn-secondary" id="btn-reset-desiccant">${t("maint.reset_desiccant")}</button>
     </div>
 
     <div class="tab-section-heading">${t("maint.bowl")}</div>
@@ -784,9 +1021,9 @@ function buildMaintenanceTab(device) {
         style="max-width:90px;color:${bCol}">
     </div>
     <label class="form-label">${t("maint.bowl_clean_every")}</label>
-    <div style="display:flex;gap:8px;margin-bottom:18px">
-      <input class="form-input" id="maint-bowl-interval" type="number" min="1" max="90" value="${device.bowl_cleaning_interval_days ?? 7}" style="flex:1">
-      <button class="btn-secondary" id="btn-record-bowl" style="flex-shrink:0">${t("maint.record_bowl")}</button>
+    <div class="maint-action-row">
+      <input class="form-input" id="maint-bowl-interval" type="number" min="1" max="90" value="${device.bowl_cleaning_interval_days ?? 7}">
+      <button class="btn-secondary" id="btn-record-bowl">${t("maint.record_bowl")}</button>
     </div>
 
     <div class="tab-section-heading">${t("maint.housing")}</div>
@@ -798,9 +1035,9 @@ function buildMaintenanceTab(device) {
         style="max-width:90px;color:${hCol}">
     </div>
     <label class="form-label">${t("maint.bowl_clean_every")}</label>
-    <div style="display:flex;gap:8px;margin-bottom:18px">
-      <input class="form-input" id="maint-housing-interval" type="number" min="1" max="365" value="${device.housing_cleaning_interval_days ?? 30}" style="flex:1">
-      <button class="btn-secondary" id="btn-record-housing" style="flex-shrink:0">${t("maint.record_housing")}</button>
+    <div class="maint-action-row">
+      <input class="form-input" id="maint-housing-interval" type="number" min="1" max="365" value="${device.housing_cleaning_interval_days ?? 30}">
+      <button class="btn-secondary" id="btn-record-housing">${t("maint.record_housing")}</button>
     </div>`;
   }
 
@@ -1183,6 +1420,7 @@ function buildScheduleTab(plans) {
         ${[1,2,3,4,5].map(n=>`<div class="portion-chip${n===1?" on":""}" data-n="${n}">${escHtml(fmtPortions(n, _currentDevice?.calibrated_grams_per_portion, _currentDevice?.feed_unit))}</div>`).join("")}
       </div>
     </div>
+    <!-- TODO: Align scheduled feeding sound behavior and controls with the official PetLibro app. -->
     <div class="form-row" style="display:flex;align-items:center;gap:10px">
       <input type="checkbox" id="sf-sound" style="width:16px;height:16px;accent-color:var(--pl-accent);flex-shrink:0">
       <label for="sf-sound" style="margin:0;flex-shrink:0">${t("schedule.sound")}</label>
@@ -1556,11 +1794,9 @@ function wireCameraExposureToggle(device) {
   const expose = document.getElementById("camera-ha-expose");
   const exposeStatus = document.getElementById("camera-ha-expose-status");
   if (!expose) return;
-  expose.onclick = async () => {
+  expose.onchange = async () => {
     if (expose.disabled) return;
-    const enabled = expose.getAttribute("aria-checked") !== "true";
-    expose.setAttribute("aria-checked", String(enabled));
-    expose.className = `toggle-switch camera-ha-expose-toggle ${enabled ? "sw-on" : "sw-off"}`;
+    const enabled = expose.checked;
     expose.disabled = true;
     exposeStatus.textContent = enabled ? "Registering with Home Assistant…" : "Removing from Home Assistant…";
     try {
@@ -1568,8 +1804,7 @@ function wireCameraExposureToggle(device) {
       _patchDevice(device.serial, { live_camera_exposed: enabled });
       exposeStatus.textContent = enabled ? "Live camera added to Home Assistant." : "Live camera removed from Home Assistant.";
     } catch (error) {
-      expose.setAttribute("aria-checked", String(!enabled));
-      expose.className = `toggle-switch camera-ha-expose-toggle ${!enabled ? "sw-on" : "sw-off"}`;
+      expose.checked = !enabled;
       exposeStatus.textContent = error.message || "Could not update Home Assistant camera.";
     } finally {
       expose.disabled = false;
@@ -1580,16 +1815,15 @@ function wireCameraExposureToggle(device) {
 function wireCameraPowerWithLiveViewToggle(device) {
   const toggle = document.getElementById("camera-power-with-live-view");
   if (!toggle) return;
-  toggle.onclick = async () => {
+  toggle.onchange = async () => {
     if (toggle.disabled) return;
-    const enabled = toggle.getAttribute("aria-checked") !== "true";
+    const enabled = toggle.checked;
     const section = toggle.closest("section");
     const cameraToggle = section?.querySelector('[data-camera-setting="cameraSwitch"]');
     const body = section?.querySelector(".camera-settings-body");
     const exposure = document.getElementById("camera-ha-expose-row");
     const applyVisibility = value => {
-      toggle.setAttribute("aria-checked", String(value));
-      toggle.className = `toggle-switch camera-ha-expose-toggle ${value ? "sw-on" : "sw-off"}`;
+      toggle.checked = value;
       if (cameraToggle) cameraToggle.hidden = value;
       if (exposure) exposure.hidden = value;
       if (body) body.hidden = !value && cameraToggle?.classList.contains("sw-off");
@@ -1623,13 +1857,25 @@ function wireDeviceTabHandlers(tabName) {
     const start = document.getElementById("camera-live-start");
     const status = document.getElementById("camera-live-status");
     const placeholder = document.getElementById("camera-live-placeholder");
+    const snapshotImage = document.getElementById("camera-live-snapshot-image");
     const sound = document.getElementById("camera-live-sound");
     const controls = document.getElementById("camera-live-controls");
     const stop = document.getElementById("camera-live-stop");
+    const showStopControl = _settings.camera_preload_live_feeds !== true;
+    const snapshot = document.getElementById("camera-live-snapshot");
+    const record = document.getElementById("camera-live-record");
+    const fullscreen = document.getElementById("camera-live-fullscreen");
     const resolution = document.getElementById("camera-live-resolution");
     const nightVision = document.getElementById("camera-live-night-vision");
     if (resolution) resolution.value = d.resolution || "P1080";
     if (nightVision) nightVision.value = d.nightVision || "AUTOMATIC";
+    const syncSelectChipLabel = select => {
+      const label = select?.closest(".overview-live-camera-select-chip");
+      const value = label?.querySelector(".camera-control-value");
+      if (value && select.selectedOptions[0]) value.textContent = select.selectedOptions[0].textContent;
+    };
+    syncSelectChipLabel(resolution);
+    syncSelectChipLabel(nightVision);
     const sendCameraSetting = async (field, value) => {
       if (!d.serial) return;
       try {
@@ -1647,8 +1893,8 @@ function wireDeviceTabHandlers(tabName) {
         status.textContent = error.message || "Could not update camera setting.";
       }
     };
-    if (resolution) resolution.onchange = () => sendCameraSetting("resolution", resolution.value);
-    if (nightVision) nightVision.onchange = () => sendCameraSetting("nightVision", nightVision.value);
+    if (resolution) resolution.onchange = () => { syncSelectChipLabel(resolution); sendCameraSetting("resolution", resolution.value); };
+    if (nightVision) nightVision.onchange = () => { syncSelectChipLabel(nightVision); sendCameraSetting("nightVision", nightVision.value); };
     if (controls) controls.hidden = false;
     if (stop) stop.hidden = true;
     const setSoundState = (muted) => {
@@ -1664,13 +1910,86 @@ function wireDeviceTabHandlers(tabName) {
       setSoundState(video.muted);
       if (!video.muted) video.play().catch(() => {});
     };
+    if (fullscreen) fullscreen.onclick = async event => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (document.fullscreenElement === frame || _liveCameraFullscreenFallback) {
+        exitLiveCameraFullscreen();
+        return;
+      }
+      await enterLiveCameraFullscreen(frame);
+      syncLiveCameraFullscreen();
+      resumeLiveCameraPlayback();
+      requestAnimationFrame(() => resumeLiveCameraPlayback());
+    };
+    if (snapshot) snapshot.onclick = () => {
+      const source = frame.querySelector("video, img");
+      const width = source?.videoWidth || source?.naturalWidth;
+      const height = source?.videoHeight || source?.naturalHeight;
+      if (!width || !height) { status.textContent = "Wait for a camera frame before taking a snapshot."; return; }
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(source, 0, 0, width, height);
+        canvas.toBlob(blob => {
+          if (blob) downloadLiveCameraBlob(blob, "jpg");
+          else status.textContent = "Could not save the snapshot.";
+        }, "image/jpeg", 0.92);
+      } catch (error) { status.textContent = error.message || "Could not capture the snapshot."; }
+    };
+    if (record) record.onclick = () => {
+      if (_liveCameraRecording) { stopLiveCameraRecording(); return; }
+      const video = frame.querySelector("video");
+      const image = frame.querySelector("img");
+      if (!frame.classList.contains("is-live") || (!video && !image)) return;
+      if (!window.MediaRecorder) { status.textContent = "Video recording is unavailable in this browser."; return; }
+      let timer = null;
+      let captureStream = video?.srcObject || video?.captureStream?.();
+      try {
+        if (!captureStream) {
+          const width = image?.naturalWidth, height = image?.naturalHeight;
+          if (!width || !height) throw new Error("Wait for a camera frame before recording.");
+          const canvas = document.createElement("canvas");
+          canvas.width = width; canvas.height = height;
+          const context = canvas.getContext("2d");
+          const draw = () => context.drawImage(image, 0, 0, width, height);
+          draw();
+          captureStream = canvas.captureStream(10);
+          timer = setInterval(() => { try { draw(); } catch { stopLiveCameraRecording(); } }, 100);
+        }
+        const mimeType = ["video/webm;codecs=vp8,opus", "video/webm;codecs=vp8", "video/webm", "video/mp4"]
+          .find(type => MediaRecorder.isTypeSupported(type));
+        const recorder = new MediaRecorder(captureStream, mimeType ? { mimeType } : undefined);
+        const chunks = [];
+        recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+        recorder.onstop = () => {
+          if (timer) captureStream.getTracks().forEach(track => track.stop());
+          if (chunks.length) {
+            downloadLiveCameraBlob(new Blob(chunks, { type: recorder.mimeType }), recorder.mimeType.includes("mp4") ? "mp4" : "webm");
+            if (status?.isConnected) status.textContent = frame.classList.contains("is-live") ? "Video downloaded" : "";
+          }
+          else if (status?.isConnected) status.textContent = "No video was captured.";
+        };
+        recorder.onerror = () => { if (status?.isConnected) status.textContent = "Video recording failed."; stopLiveCameraRecording(); };
+        recorder.start(1000);
+        _liveCameraRecording = { recorder, timer };
+        record.innerHTML = '<span class="material-icons" aria-hidden="true">stop_circle</span>';
+        record.title = "Stop recording and download";
+        record.setAttribute("aria-label", record.title);
+        record.setAttribute("aria-pressed", "true");
+        status.textContent = "Recording…";
+      } catch (error) {
+        if (timer) { clearInterval(timer); captureStream?.getTracks().forEach(track => track.stop()); }
+        status.textContent = error.message || "Could not start recording.";
+      }
+    };
     const stopCameraView = () => {
       stopLiveCamera();
       frame?.querySelector("video")?.remove();
       if (sound) sound.hidden = true;
       if (placeholder) placeholder.style.display = "";
       if (start) {
-        start.textContent = "Click to start live view";
+        start.textContent = "Start live view";
         start.hidden = false;
         start.disabled = false;
       }
@@ -1678,16 +1997,53 @@ function wireDeviceTabHandlers(tabName) {
     if (stop) stop.onclick = stopCameraView;
     if (start && frame) start.onclick = async () => {
       // A Status rerender can replace the button while setup is still pending.
-      if (_liveCameraPc || _liveCameraPowerOwner) stopLiveCamera();
+      if (_liveCameraPc || _liveCameraBridge || _liveCameraPowerOwner) stopLiveCamera();
       const generation = ++_liveCameraGeneration;
       const current = () => generation === _liveCameraGeneration;
       const powerWithLiveView = d.camera_power_with_live_view === true;
+      if (_settings.camera_preload_live_feeds === true) {
+        const background = getBackgroundCamera(d.serial);
+        if (background) {
+          start.disabled = true;
+          start.hidden = true;
+          frame.classList.add("is-connecting");
+          status.textContent = "Connecting…";
+          if (await background.ready && current() && getBackgroundCamera(d.serial) === background && !background.closed) {
+            _liveCameraBackgroundSerial = d.serial;
+            frame.prepend(background.video);
+            background.video.play().catch(() => {});
+            frame.classList.remove("is-connecting");
+            frame.classList.add("is-live");
+            if (snapshotImage) snapshotImage.hidden = true;
+            if (placeholder) placeholder.style.display = "none";
+            if (stop) stop.hidden = !showStopControl;
+            if (sound) sound.hidden = !!background.bridge;
+            const vp8Hint = document.getElementById("camera-windows-vp8-hint");
+            if (vp8Hint) vp8Hint.hidden = !!background.bridge || _settings.camera_vp8_transcoding === true;
+            setSoundState(background.video.muted);
+            status.textContent = background.bridge ? "Live via Home Assistant" : "Live";
+            start.disabled = false;
+            muteCameraForTalk();
+            return;
+          }
+          if (!current()) return;
+          frame.classList.remove("is-connecting");
+          start.hidden = false;
+          start.disabled = false;
+        }
+      }
       if (d.cameraSwitch === false && !powerWithLiveView) {
         status.textContent = "Enable the camera to start live view.";
         return;
       }
       start.disabled = true;
       start.hidden = true;
+      const showSnapshot = () => {
+        if (snapshotImage?.complete && snapshotImage.naturalWidth) snapshotImage.hidden = false;
+      };
+      showSnapshot();
+      snapshotImage?.addEventListener("load", showSnapshot, { once: true });
+      frame.classList.add("is-connecting");
       status.textContent = "Connecting…";
       if (powerWithLiveView) {
         const owner = { serial: d.serial };
@@ -1721,7 +2077,9 @@ function wireDeviceTabHandlers(tabName) {
         video.onloadeddata = () => {
           if (!current()) return;
           status.textContent = "Live"; start.hidden = true; start.disabled = false;
-          if (stop) stop.hidden = false;
+          frame.classList.remove("is-connecting");
+          if (snapshotImage) snapshotImage.hidden = true;
+          if (stop) stop.hidden = !showStopControl;
           frame.classList.add("is-live");
           const vp8Hint = document.getElementById("camera-windows-vp8-hint");
           if (vp8Hint) vp8Hint.hidden = _settings.camera_vp8_transcoding === true;
@@ -1746,17 +2104,53 @@ function wireDeviceTabHandlers(tabName) {
         _liveCameraSession = response.headers.get("X-Petlibro-WebRTC-Session");
         _liveCameraSerial = d.serial;
         await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
+        // A successful SDP exchange does not mean the browser can reach the
+        // add-on's LAN-only ICE candidate (common through remote HA ingress).
+        const connected = await new Promise(resolve => {
+          if (video.readyState >= 2) return resolve(true);
+          const finish = value => {
+            clearTimeout(timer);
+            video.removeEventListener("loadeddata", loaded);
+            pc.removeEventListener("connectionstatechange", changed);
+            resolve(value);
+          };
+          const loaded = () => finish(true);
+          const changed = () => { if (["failed", "closed"].includes(pc.connectionState)) finish(false); };
+          const timer = setTimeout(() => finish(false), 12000);
+          video.addEventListener("loadeddata", loaded, { once: true });
+          pc.addEventListener("connectionstatechange", changed);
+        });
+        if (!current()) return;
+        if (!connected) throw new Error("Direct camera connection timed out");
       } catch (error) {
         if (!current()) return;
-        stopLiveCamera();
-        frame.classList.remove("is-live");
+        video.onloadeddata = null;
+        closeLiveCameraWebrtc();
         video.remove();
+        status.textContent = "Connecting through Home Assistant…";
+        try {
+          const bridge = openLiveCameraVideoBridge(d.serial, frame, () => {
+            if (!current()) return;
+            stopLiveCamera();
+            status.textContent = "Camera video stream disconnected.";
+          });
+          _liveCameraBridge = bridge;
+          if (await bridge.ready && current()) {
+            frame.classList.add("is-live");
+          frame.classList.remove("is-connecting");
+          if (snapshotImage) snapshotImage.hidden = true;
+            status.textContent = "Live via Home Assistant";
+            if (stop) stop.hidden = !showStopControl;
+            start.disabled = false;
+            return;
+          }
+        } catch (bridgeError) {
+          error = bridgeError;
+        }
+        if (!current()) return;
+        stopLiveCamera();
         if (placeholder) { placeholder.textContent = "Camera stream unavailable."; placeholder.style.display = ""; }
-        status.textContent = error.message;
-        start.textContent = "Click to start live view";
-        start.hidden = false;
-        start.disabled = false;
-        if (stop) stop.hidden = true;
+        status.textContent = error.message || "Camera stream unavailable";
       }
     };
     if (_settings.camera_auto_start_live_view === true) start?.click();
@@ -1767,16 +2161,17 @@ function wireDeviceTabHandlers(tabName) {
       const field = el.dataset.cameraSetting;
       const isToggle = el.dataset.toggle === "true";
       let savedValue = el.type === "checkbox" ? el.checked : el.value;
-      if (el.type === "range") {
-        el.addEventListener("input", () => {
-          el.closest(".camera-volume-control").querySelector("output").value = el.value;
-        });
-      }
+      const syncRange = el.type === "range" ? () => {
+        el.closest(".camera-volume-control").querySelector("output").value = el.value;
+        el.style.setProperty("--volume-progress", `${Math.max(0, Math.min(100, Number(el.value) || 0))}%`);
+      } : null;
+      if (syncRange) { syncRange(); el.addEventListener("input", syncRange); }
       const save = async () => {
         const previous = d[field];
         let value = isToggle ? el.classList.contains("sw-off") : el.type === "checkbox" ? el.checked : el.value;
         if (isToggle) {
-          el.className = `toggle-switch ${value ? "sw-on" : "sw-off"}`;
+          el.classList.toggle("sw-on", value);
+          el.classList.toggle("sw-off", !value);
           el.closest("section").querySelector(".camera-settings-body").hidden = !value;
           el.disabled = true;
         }
@@ -1820,6 +2215,7 @@ function wireDeviceTabHandlers(tabName) {
           if (!isToggle) {
             if (el.type === "checkbox") el.checked = savedValue;
             else el.value = savedValue;
+            syncRange?.();
           }
           if (field === "videoRecordAgingType" || field === "lightAgingType") {
             el.checked = Number(previous ?? 1) === 2;
@@ -1827,7 +2223,8 @@ function wireDeviceTabHandlers(tabName) {
             if (times) times.hidden = !el.checked;
           }
           if (isToggle) {
-            el.className = `toggle-switch ${!value ? "sw-on" : "sw-off"}`;
+            el.classList.toggle("sw-on", !value);
+            el.classList.toggle("sw-off", value);
             el.closest("section").querySelector(".camera-settings-body").hidden = value;
           }
           if (status) status.textContent = t("overview.failed");
@@ -2029,20 +2426,36 @@ function wireDeviceTabHandlers(tabName) {
     const closeLid = document.getElementById("btn-close-lid");
 
     if (feedNow) {
+      feedNow.disabled = !!d.manual_feed_pending;
+      if (d.manual_feed_pending) feedNow.textContent = t("overview.waiting_for_feed");
       feedNow.onclick = async () => {
+        if (feedNow.disabled) return;
         const portions = parseInt(document.getElementById("feeder-portions").value) || 1;
         feedNow.textContent = t("overview.feeding");
         feedNow.disabled = true;
         try {
-          await api("POST", `/api/devices/${d.serial}/command`, {
+          const result = await api("POST", `/api/devices/${d.serial}/command`, {
             cmd: "MANUAL_FEEDING_SERVICE",
             grainNum: portions,
           });
-          feedNow.textContent = t("overview.sent");
+          if (result.status === "pending" || result.status === "ok") {
+            d.manual_feed_pending = true;
+            feedNow.textContent = t("overview.waiting_for_feed");
+          }
         } catch(e) {
-          feedNow.textContent = t("overview.failed");
+          if (e.message.startsWith("409 ")) {
+            d.manual_feed_pending = true;
+            feedNow.textContent = t("overview.waiting_for_feed");
+          } else {
+            feedNow.textContent = t("overview.failed");
+            setTimeout(() => {
+              if (!d.manual_feed_pending) {
+                feedNow.textContent = t("overview.feed_now");
+                feedNow.disabled = false;
+              }
+            }, 2000);
+          }
         }
-        setTimeout(() => { feedNow.textContent = t("overview.feed_now"); feedNow.disabled = false; }, 2000);
       };
     }
     if (openLid) {

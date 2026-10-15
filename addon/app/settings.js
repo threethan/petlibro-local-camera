@@ -305,6 +305,10 @@ function renderSettings() {
   if (devicePingCb) devicePingCb.checked = _settings.device_ping_enabled !== false;
   const cameraAutoStartEl = document.getElementById("s-camera-auto-start");
   if (cameraAutoStartEl) cameraAutoStartEl.checked = _settings.camera_auto_start_live_view === true;
+  const cameraPreloadEl = document.getElementById("s-camera-preload-live-feeds");
+  if (cameraPreloadEl) cameraPreloadEl.checked = _settings.camera_preload_live_feeds === true;
+  const forceLandscapeMobileEl = document.getElementById("s-camera-force-landscape-mobile");
+  if (forceLandscapeMobileEl) forceLandscapeMobileEl.checked = _settings.camera_force_landscape_mobile === true;
   const emailTo = document.getElementById("s-notify-email-to");
   if (emailTo) emailTo.value = _settings.notify_email_to || "";
 
@@ -351,6 +355,8 @@ async function saveSettings(fromTab) {
     language: document.getElementById("s-language").value,
     device_ping_enabled: document.getElementById("s-device-ping-enabled")?.checked !== false,
     camera_auto_start_live_view: document.getElementById("s-camera-auto-start")?.checked === true,
+    camera_preload_live_feeds: document.getElementById("s-camera-preload-live-feeds")?.checked === true,
+    camera_force_landscape_mobile: document.getElementById("s-camera-force-landscape-mobile")?.checked === true,
     units: document.getElementById("s-units").value,
     feeder_timezone: document.getElementById("s-feeder-tz")?.value || "America/Denver",
     notify_bell_enabled: document.getElementById("s-notify-bell")?.checked !== false,
@@ -367,8 +373,18 @@ async function saveSettings(fromTab) {
   try {
     const result = await api("POST", "/api/settings", body);
     _settings = result;
-    const ind = document.getElementById(`save-indicator-${fromTab}`);
-    if (ind) { ind.classList.add("show"); setTimeout(() => ind.classList.remove("show"), 2000); }
+    syncLiveCameraFullscreen();
+    syncBackgroundCameras();
+    const saveButtonId = fromTab === "audio" ? "btn-save-audio-settings" : `btn-save-${fromTab}`;
+    const saveButton = document.getElementById(saveButtonId);
+    if (saveButton) {
+      clearTimeout(saveButton._savedLabelTimeout);
+      const originalLabel = saveButton.dataset.i18n;
+      saveButton.textContent = t("settings.saved");
+      saveButton._savedLabelTimeout = setTimeout(() => {
+        saveButton.textContent = t(originalLabel);
+      }, 2000);
+    }
     if (result.mqtt_ok === true) {
       statusEl.className = "mqtt-status ok";
       statusEl.textContent = t("settings.mqtt_ok");

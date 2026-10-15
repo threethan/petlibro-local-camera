@@ -11,7 +11,7 @@ function renderPets() {
     </div>`;
     return;
   }
-  list.innerHTML = _pets.map(p => `<div class="pet-card" data-pet-id="${escHtml(p.id)}" style="position:relative">
+  list.innerHTML = _pets.map(p => `<div class="ha-card pet-card" data-pet-id="${escHtml(p.id)}" style="position:relative">
     <div class="pet-avatar">${p.image_url ? `<img src="${escHtml(p.image_url)}" alt="">` : `<span class="material-icons">pets</span>`}</div>
     <div class="pet-info">
       <div class="pet-name">${escHtml(p.name || "Unnamed pet")}</div>

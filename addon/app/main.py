@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 _LOGGER = logging.getLogger(__name__)
 
-VERSION = "2026.10.7"
+VERSION = "2026.10.8"
 
 # Credential capture state
 _capture_state: dict = {"status": "idle", "result": {}}
@@ -314,6 +314,54 @@ async def handle_api_camera_live(request):
     return response
 
 
+async def handle_api_camera_snapshot(request):
+    """Return the cached MQTT/HA snapshot for the web UI's live-view fallback."""
+    image = camera.latest_snapshot(request.match_info["serial"])
+    if image is None:
+        return web.Response(status=404, text="No camera snapshot is available yet")
+    return web.Response(
+        body=image,
+        content_type="image/jpeg",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+async def handle_api_camera_live_video(request):
+    """Relay a temporary fragmented MP4 stream through Home Assistant ingress."""
+    serial = request.match_info["serial"]
+    if not camera.live_stream_available(serial):
+        return web.Response(status=409, text="Camera is unavailable or another live view is active")
+    chunks = camera.live_video_chunks(serial)
+    try:
+        first_chunk = await asyncio.wait_for(anext(chunks), timeout=15)
+    except Exception as error:
+        await chunks.aclose()
+        _LOGGER.warning("Video bridge startup failed for %s...: %s", serial[:6], error, exc_info=True)
+        return web.Response(status=503, text="Camera video could not start")
+
+    response = web.StreamResponse(headers={
+        "Content-Type": "video/mp4",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-Accel-Buffering": "no",
+    })
+    try:
+        await response.prepare(request)
+        await response.write(first_chunk)
+        async for chunk in chunks:
+            await response.write(chunk)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    except Exception:
+        _LOGGER.exception("Video bridge failed for %s...", serial[:6])
+    finally:
+        await chunks.aclose()
+        try:
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+    return response
+
+
 async def handle_api_camera_webrtc(request):
     serial = request.match_info["serial"]
     offer = await request.read()
@@ -504,6 +552,10 @@ async def handle_api_device_command(request):
         # Normal command dicts fall through to send_command inside that function.
         await devices.handle_ha_command(serial, payload)
         return web.json_response({"status": "ok"})
+    except devices.ManualFeedBusyError as exc:
+        return web.json_response({"status": "busy", "detail": str(exc)}, status=409)
+    except devices.ManualFeedPendingError as exc:
+        return web.json_response({"status": "pending", "detail": str(exc)}, status=202)
     except asyncio.TimeoutError as exc:
         _LOGGER.warning("Device command timed out for %s...: %s", serial[:6], exc)
         return web.Response(status=504, text="Device did not acknowledge the command")
@@ -1180,6 +1232,8 @@ def main():
     app.router.add_get("/api/devices",                   handle_api_devices_get)
     app.router.add_post("/api/devices/ping",             handle_api_devices_ping)
     app.router.add_get("/api/devices/{serial}/camera/live", handle_api_camera_live)
+    app.router.add_get("/api/devices/{serial}/camera/snapshot", handle_api_camera_snapshot)
+    app.router.add_get("/api/devices/{serial}/camera/live.mp4", handle_api_camera_live_video)
     app.router.add_get("/api/devices/{serial}/camera/talk", camera_talk.handle_talk)
     app.router.add_post("/api/devices/{serial}/camera/webrtc", handle_api_camera_webrtc)
     app.router.add_delete("/api/devices/{serial}/camera/webrtc/{session_id}", handle_api_camera_webrtc_close)

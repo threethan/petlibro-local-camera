@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <script>window.__BASE__ = "{{BASE}}"; window.__VERSION__ = "{{VERSION}}";</script>
 <link rel="stylesheet" href="app.css?v={{VERSION}}">
+<script src="theme.js?v={{VERSION}}"></script>
 </head>
 <body>
 
@@ -68,7 +69,7 @@
 
     <!-- General tab -->
     <div class="stab-panel active" id="stab-general">
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.units_heading">Units</h2>
         <div class="form-row">
           <label class="form-label" data-i18n="settings.units_label">Measurement System</label>
@@ -79,7 +80,7 @@
           </select>
         </div>
       </div>
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.tz_heading">Feeder Timezone</h2>
         <div class="form-row">
           <label class="form-label" data-i18n="settings.tz_label">Timezone</label>
@@ -120,28 +121,25 @@
           <p class="form-hint" data-i18n="settings.tz_hint">Daylight saving time is handled automatically. Enter schedule times in local time — the app converts to UTC for the feeder. Change takes effect after feeder reconnects.</p>
         </div>
       </div>
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.language">Language</h2>
         <div class="form-row">
           <select class="form-select" id="s-language"></select>
         </div>
       </div>
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.device_ping_heading">Device status</h2>
         <div class="form-row settings-check-row">
           <label><input type="checkbox" id="s-device-ping-enabled"> <span data-i18n="settings.device_ping_enabled">Check device status while this page is visible</span></label>
           <p class="form-hint" data-i18n="settings.device_ping_hint">Send a device check every 5 seconds and mark devices offline when they do not respond.</p>
         </div>
       </div>
-      <button class="btn-primary" id="btn-save-general">
-        <span data-i18n="settings.save">Save</span>
-        <span class="save-indicator" id="save-indicator-general" data-i18n="settings.saved"><span class="material-icons">done</span> Saved</span>
-      </button>
+      <button class="btn-primary" id="btn-save-general" data-i18n="settings.save">Save</button>
     </div>
 
     <!-- Notifications tab -->
     <div class="stab-panel" id="stab-notifications">
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.notif_heading">Notifications</h2>
         <div class="form-row" style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
           <input type="checkbox" id="s-notify-bell" style="width:18px;height:18px;accent-color:var(--pl-accent);flex-shrink:0">
@@ -170,15 +168,12 @@
           <p class="form-hint" data-i18n="settings.mobile_hint">Mobile alerts are push notifications sent through the Home Assistant Companion app on your phone, not text messages. This is the default phone (mobile_app service) used when a device has Mobile enabled but no per-device service set.</p>
         </div>
       </div>
-      <button class="btn-primary" id="btn-save-notifications">
-        <span data-i18n="settings.save">Save</span>
-        <span class="save-indicator" id="save-indicator-notifications" data-i18n="settings.saved"><span class="material-icons">done</span> Saved</span>
-      </button>
+      <button class="btn-primary" id="btn-save-notifications" data-i18n="settings.save">Save</button>
     </div>
 
     <!-- MQTT tab -->
     <div class="stab-panel" id="stab-mqtt">
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.mqtt_section">MQTT Broker</h2>
         <div class="form-row">
           <label class="form-label" data-i18n="settings.mqtt_host">Host</label>
@@ -206,16 +201,13 @@
         <button class="btn-secondary" id="btn-auto-mqtt" type="button" style="margin-top: 12px" data-i18n="settings.mqtt_auto_add">Create MQTT login for me</button>
         <div class="mqtt-status" id="mqtt-auto-status" role="status" aria-live="polite"></div>
       </div>
-      <button class="btn-primary" id="btn-save-mqtt">
-        <span data-i18n="settings.mqtt_save_test">Save &amp; Test</span>
-        <span class="save-indicator" id="save-indicator-mqtt" data-i18n="settings.saved"><span class="material-icons">done</span> Saved</span>
-      </button>
+      <button class="btn-primary" id="btn-save-mqtt" data-i18n="settings.mqtt_save_test">Save &amp; Test</button>
       <div class="mqtt-status" id="mqtt-status"></div>
     </div>
 
     <!-- Audio tab -->
     <div class="stab-panel" id="stab-audio">
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.audio_section">Custom Feed Sounds</h2>
         <div class="form-row">
           <label class="form-label" data-i18n="settings.local_audio_base_url">Local Audio Base URL</label>
@@ -227,12 +219,9 @@
           <p class="form-hint" data-i18n="settings.local_audio_base_url_hint">A plain LAN address to serve custom sounds. Defaults to one served by this Add-On. Set a custom sound on your feeder and dispatch a manual feed to test.</p>
         </div>
       </div>
-      <button class="btn-primary" id="btn-save-audio-settings">
-        <span data-i18n="settings.save">Save</span>
-        <span class="save-indicator" id="save-indicator-audio" data-i18n="settings.saved"><span class="material-icons">done</span> Saved</span>
-      </button>
+      <button class="btn-primary" id="btn-save-audio-settings" data-i18n="settings.save">Save</button>
 
-      <div class="settings-section" style="margin-top:24px">
+      <div class="ha-card settings-section" style="margin-top:24px">
         <h2 data-i18n="settings.audio_library">Sound Library</h2>
         <p class="form-hint" data-i18n="settings.audio_library_hint">Shared across all feeders. Push any of these to a specific feeder from its Maintenance tab.</p>
         <div id="audio-library-list" style="display:flex;flex-direction:column;gap:8px;margin:12px 0"></div>
@@ -251,7 +240,7 @@
 
     <!-- Camera tab -->
     <div class="stab-panel" id="stab-camera">
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.camera_snapshots_heading">Snapshot Camera</h2>
         <div class="form-row settings-check-row">
           <label><input type="checkbox" id="s-camera-snapshot-enabled"> <span data-i18n="settings.camera_snapshot_enabled">Enable snapshot camera</span></label>
@@ -262,20 +251,26 @@
           <p class="form-hint" data-i18n="settings.camera_snapshot_interval_hint">Choose an interval from 1 to 300 seconds. Changes apply immediately to active camera feeds.</p>
         </div>
       </div>
-      <div class="settings-section">
+      <div class="ha-card settings-section">
         <h2 data-i18n="settings.camera_live_heading">Live video</h2>
         <div class="form-row settings-check-row">
           <label><input type="checkbox" id="s-camera-auto-start"> <span data-i18n="settings.camera_auto_start">Automatically start live view when opening a camera feeder</span></label>
+          <p class="form-hint" data-i18n="settings.camera_auto_start_hint">Start connecting the camera live when viewing the status of eligible devices. Otherwise, starting it requires an additional click.</p>
+        </div>
+        <div class="form-row settings-check-row">
+          <label><input type="checkbox" id="s-camera-preload-live-feeds"> <span data-i18n="settings.camera_preload_live_feeds">Preload all live feeds when opening the web UI</span></label>
+          <p class="form-hint" data-i18n="settings.camera_preload_live_feeds_hint">Starts loading live views the moment this Web UI is opened, and closes them only when its closed. Gives faster access at the cost of performance.</p>
+        </div>
+        <div class="form-row settings-check-row">
+          <label><input type="checkbox" id="s-camera-force-landscape-mobile"> <span data-i18n="settings.camera_force_landscape_mobile">Force landscape video on mobile</span></label>
+          <p class="form-hint" data-i18n="settings.camera_force_landscape_mobile_hint">Rotate fullscreen live video 90° when a mobile browser is in portrait.</p>
         </div>
         <div class="form-row settings-check-row">
           <label><input type="checkbox" id="s-camera-vp8-transcoding"> <span data-i18n="settings.camera_vp8_transcoding">Transcode live video to VP8</span></label>
           <p class="form-hint" data-i18n="settings.camera_vp8_transcoding_hint">Uses additional CPU. Intended to resolve decoding artifacts on many clients, such as Chrome on Windows.</p>
         </div>
       </div>
-      <button class="btn-primary" id="btn-save-camera">
-        <span data-i18n="settings.save">Save</span>
-        <span class="save-indicator" id="save-indicator-camera" data-i18n="settings.saved"><span class="material-icons">done</span> Saved</span>
-      </button>
+      <button class="btn-primary" id="btn-save-camera" data-i18n="settings.save">Save</button>
     </div>
 
   </div>
@@ -308,17 +303,17 @@
 <div class="modal-backdrop" id="modal-device">
   <div class="modal" id="modal-device-inner">
     <button class="modal-close" id="btn-close-device"><span class="material-icons">close</span></button>
-    <button class="detail-edit-btn" id="btn-detail-edit" title="Edit device" aria-label="Edit device"><span class="material-icons">settings</span></button>
+    <button class="detail-edit-btn" id="btn-detail-edit" title="Edit device" aria-label="Edit device"><span class="material-icons">edit</span></button>
     <div class="detail-header" id="detail-header">
       <div class="detail-img" id="detail-img"><span><span class="material-icons">local_dining</span></span></div>
-      <div>
+      <div class="detail-info">
         <div class="detail-title" id="detail-name"></div>
         <div class="detail-room" id="detail-room"></div>
         <div class="detail-status">
           <span class="status-badge" id="detail-status-badge"></span>
           <span class="rssi-badge rssi-na" id="detail-rssi" data-i18n="signal.none">No signal</span>
-          <span class="fw-badge" id="detail-fw" style="display:none"></span>
-          <span class="fw-badge" id="detail-hw" style="display:none"></span>
+          <span class="fw-badge device-version-badge" id="detail-fw" style="display:none"></span>
+          <span class="fw-badge device-version-badge" id="detail-hw" style="display:none"></span>
           <span class="fw-badge" id="detail-power" style="display:none"></span>
           <span class="fw-badge" id="detail-clock" style="display:none"></span>
         </div>
@@ -854,6 +849,7 @@
 <script src="api.js?v={{VERSION}}"></script>
 <script src="render.js?v={{VERSION}}"></script>
 <script src="modal-device.js?v={{VERSION}}"></script>
+<script src="background-camera.js?v={{VERSION}}"></script>
 <script src="camera-talk.js?v={{VERSION}}"></script>
 <script src="toggles.js?v={{VERSION}}"></script>
 <script src="modal-edit.js?v={{VERSION}}"></script>
