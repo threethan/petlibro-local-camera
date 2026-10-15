@@ -4,14 +4,20 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+
+	"github.com/AlexxIT/go2rtc/pkg/tutk"
 )
 
 var ErrTalkbackBusy = errors.New("another microphone is already using the speaker")
 
+const (
+	talkbackSessionMagicVersion = 0x1D
+	talkbackSessionFlags        = 0x0B
+)
+
 type talkbackState struct {
 	connected    bool
 	frame        uint32
-	controlIndex uint32
 }
 
 // StartTalkback enables the speaker on the current Session16 stream. The
@@ -30,10 +36,9 @@ func (s *Session) StartTalkback(ctx context.Context) error {
 		s.talkMu.Unlock()
 		return ErrTalkbackBusy
 	}
-	talk := &talkbackState{controlIndex: 3}
+	talk := &talkbackState{}
 	s.talk = talk
-	err := s.sendTalkControl(0x0350, talk.controlIndex)
-	talk.controlIndex++
+	err := s.sendTalkControl(0x0350)
 	if err != nil {
 		s.talk = nil
 		s.talkMu.Unlock()
@@ -44,26 +49,30 @@ func (s *Session) StartTalkback(ctx context.Context) error {
 	return nil
 }
 
-func (s *Session) sendTalkControl(control uint32, index uint32) error {
-	payload := make([]byte, 12)
-	binary.LittleEndian.PutUint32(payload, control)
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	body := encodeControlData(s.session25.nextOutboundCommand(), controlChannelSystem, index, payload)
-	return s.sendBodyLocked(body)
-}
-
 func (s *Session) StopTalkback() error {
 	s.talkMu.Lock()
 	defer s.talkMu.Unlock()
 	if s.talk == nil {
 		return nil
 	}
-	talk := s.talk
 	s.talk = nil
-	err := s.sendTalkControl(0x0351, talk.controlIndex)
-	talk.controlIndex++
-	return err
+	return s.sendTalkControl(0x0351)
+}
+
+// Talkback uses the V3.0.30 client envelope seen in the official capture.
+// Video and inbound media retain the bridge's established transport path.
+func (s *Session) sendTalkControl(control uint32) error {
+	payload := make([]byte, 12)
+	binary.LittleEndian.PutUint32(payload, control)
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.controlIndex < 3 {
+		s.controlIndex = 3
+	}
+	index := s.controlIndex
+	s.controlIndex++
+	body := encodeControlData(s.session25.nextOutboundCommand(), controlChannelSystem, index, payload)
+	return s.sendTalkbackBodyLocked(body)
 }
 
 func (s *Session) closeTalkback() {
@@ -97,14 +106,33 @@ func (s *Session) WriteTalkback(frame []byte) error {
 	body[20] = 1
 	binary.LittleEndian.PutUint16(body[22:], 0x0010)
 	binary.LittleEndian.PutUint16(body[24:], uint16(len(frame)+16))
+	stamp := uint32(s.clock().UnixMilli())
+	binary.LittleEndian.PutUint16(body[26:], uint16(stamp))
 	binary.LittleEndian.PutUint32(body[28:], t.frame)
 	binary.LittleEndian.PutUint32(body[32:], t.frame+1)
 	copy(body[36:], frame)
 	info := body[36+len(frame):]
 	info[0], info[2] = 0x87, 0x1e
-	binary.LittleEndian.PutUint32(info[12:], uint32(s.clock().UnixMilli()))
+	binary.LittleEndian.PutUint32(info[12:], stamp)
 	t.frame++
-	return s.sendBodyLocked(body)
+	return s.sendTalkbackBodyLocked(body)
+}
+
+// sendTalkbackBodyLocked is called with sendMu held. The official Android
+// client marks only speaker traffic as 0x1d/0x0b and uses blob encryption.
+func (s *Session) sendTalkbackBodyLocked(body []byte) error {
+	sequence := s.sequence
+	s.sequence++
+	packet := make([]byte, sessionHeaderLength+len(body))
+	packet[0], packet[1] = 0x04, 0x02
+	packet[2], packet[3] = talkbackSessionMagicVersion, talkbackSessionFlags
+	binary.LittleEndian.PutUint16(packet[4:], uint16(len(packet)-16))
+	binary.LittleEndian.PutUint16(packet[6:], sequence)
+	binary.LittleEndian.PutUint16(packet[8:], clientSessionOpcode)
+	binary.LittleEndian.PutUint16(packet[10:], clientSessionSubtype)
+	copy(packet[12:28], sessionID16(s.ID))
+	copy(packet[sessionHeaderLength:], body)
+	return s.transport.SendTo(tutk.TransCodeBlob(packet), s.Address)
 }
 
 func validateTalkbackADTS(frame []byte) error {

@@ -3,9 +3,10 @@
 For full release notes and details on each version, see the [GitHub Releases page](https://github.com/smcneece/petlibro-local/releases).
 
 ## Unreleased
+- Added live microphone Talk for the PLAF203 camera feeder. The Status view streams AAC audio to the feeder over its existing local camera session using the packet sequence confirmed in the official-app capture. Physical speaker playback still needs a device check.
 - Fixed devices remaining offline in an open device dialog after reconnecting. Regular refreshes now update the dialog even with device checks disabled, and a timed-out check no longer overrides newer MQTT activity.
 - Fixed camera feeder indicator-light toggles omitting the saved schedule context. On PLAF203 firmware 3.0.30, both a bare toggle and the older Granary settings bundle can be acknowledged before the feeder disconnects/reboots. Camera indicator toggles now include the lighting mode, hours, UTC hours and duration, including commands from Home Assistant and the older controls.
-- Restored live camera AAC audio with a focused bridge patch that advances the feeder's audio control index and marks AAC payloads as raw for go2rtc. The microphone talkback and SPS/PPS video patches remain disabled. Removed a leftover talkback call from the live camera UI. Restored automatic camera snapshots using the pinned bridge revision.
+- Restored live camera AAC audio with a focused bridge patch that advances the feeder's audio control index and marks AAC payloads as raw for go2rtc. The SPS/PPS video patch remains disabled. Restored automatic camera snapshots using the pinned bridge revision.
 - Added camera feeder indicator-light controls under Sensors, with all-day or custom hours, feeder-timezone conversion, and device acknowledgements.
 - Added SD-card recording and feeding-video controls under the camera feeder's Sensors tab: continuous or motion recording, all-day or custom hours, feeding clip durations, and read-only SD status and capacity. Recording changes require a matching feeder acknowledgement.
 - Fixed live camera audio conversion stalling before it produced a browser audio track. The bridge now marks AAC access units as raw so go2rtc adds the RFC 3640 RTP headers required by FFmpeg, and the Opus converter requests only the audio input.

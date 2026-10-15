@@ -7,7 +7,7 @@ function syncCameraTalkUI() {
   const status = document.getElementById("camera-talk-status");
   if (button) {
     const label = _cameraTalk ? "Stop talking" : "Talk";
-    button.innerHTML = `<span class="material-icons" aria-hidden="true">${_cameraTalk ? "mic_off" : "mic"}</span>`;
+    button.innerHTML = `<span class="material-icons" aria-hidden="true">${_cameraTalk ? "mic_off" : "mic"}</span> ${label}`;
     button.setAttribute("aria-label", label);
     button.title = label;
     button.setAttribute("aria-pressed", String(!!_cameraTalk));

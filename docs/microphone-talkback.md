@@ -23,12 +23,13 @@ session on channel `0x0103`; it does not open a reverse AV session. It ends with
 `SPEAKERSTOP` (`0x0351`). The captured format is AAC ADTS (`0x87`), 44.1 kHz,
 mono. The bridge implementation now follows that sequence.
 
-Browser microphone controls, PCM16 streaming, FFmpeg AAC conversion, HTTP
-streaming, ownership and cleanup have passed automated tests. The overlaid Go
-bridge compiles against the pinned source. However, the updated talkback path
-has not yet been deployed to Home Assistant or verified for audible playback
-on the physical feeder; treat real-device playback as unconfirmed. The capture
-is diagnostic evidence and its microphone audio is not stored by the app.
+The add-on now builds the talkback bridge and exposes the Talk control. Browser
+microphone controls, PCM16 streaming, FFmpeg AAC conversion, HTTP streaming,
+ownership and cleanup have passed automated tests. The overlaid Go bridge
+compiles against the pinned source. The updated path has not yet been deployed
+to Home Assistant or verified for audible playback on the physical feeder;
+real-device playback remains unconfirmed. The capture is diagnostic evidence
+and its microphone audio is not stored by the app.
 
 ## Implementation
 

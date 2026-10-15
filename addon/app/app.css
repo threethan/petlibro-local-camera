@@ -758,6 +758,10 @@
 
   /* ── Camera feeder settings ── */
   .overview-live-camera { margin: 0 0 16px; }
+  .overview-camera-talk { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .overview-camera-talk button { display: inline-flex; align-items: center; gap: 6px; }
+  .overview-camera-talk button[aria-pressed="true"] { color: #fff; background: #a33636; }
+  .overview-camera-talk #camera-talk-status { font-size: 12px; color: var(--pl-subtext); }
   .overview-live-camera-frame {
     position: relative;
     width: 100%;

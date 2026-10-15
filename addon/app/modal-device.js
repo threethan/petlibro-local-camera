@@ -66,6 +66,7 @@ function stopLiveCamera() {
   if (powerOwner) releaseCameraPower(powerOwner.serial, powerOwner);
 }
 function openDeviceModal(device) {
+  stopCameraTalk();
   stopLiveCamera();
   _currentDevice = device;
   _currentDeviceTab = "overview";
@@ -161,7 +162,7 @@ function updateDeviceModalStatus(device) {
   badge.className = `status-badge ${device.online ? "online" : "offline"}`;
 
   if (wasOnline === device.online) return;
-  if (!device.online) stopLiveCamera();
+  if (!device.online) { stopCameraTalk(); stopLiveCamera(); }
   renderDeviceTab(device.online ? "overview" : "offline");
 }
 
@@ -473,6 +474,10 @@ function buildOverviewTab(device) {
           <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
         </div>
         <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
+      </div>
+      <div class="overview-camera-talk">
+        <button type="button" class="btn-secondary" id="camera-talk-toggle" aria-label="Talk" aria-pressed="false"><span class="material-icons" aria-hidden="true">mic</span> Talk</button>
+        <span id="camera-talk-status" role="status" aria-live="polite"></span>
       </div>
     </section>` : "";
     return `${liveCameraHtml}<div class="detail-stats">
@@ -1571,12 +1576,14 @@ function wireCameraPowerWithLiveViewToggle(device) {
 
 function wireDeviceTabHandlers(tabName) {
   const d = _currentDevice;
+  if (tabName !== "overview" || d.device_type !== "camera_feeder") stopCameraTalk();
   if (tabName !== "overview" || d.device_type !== "camera_feeder") stopLiveCamera();
   if (tabName === "sensors") {
     wireCameraPowerWithLiveViewToggle(d);
     wireCameraExposureToggle(d);
   }
   if (tabName === "overview" && d.device_type === "camera_feeder") {
+    wireCameraTalk(d.serial);
     const frame = document.getElementById("camera-live-frame");
     const start = document.getElementById("camera-live-start");
     const status = document.getElementById("camera-live-status");
@@ -1685,6 +1692,7 @@ function wireDeviceTabHandlers(tabName) {
           if (vp8Hint) vp8Hint.hidden = _settings.camera_vp8_transcoding === true;
           if (sound) sound.hidden = false;
           setSoundState(video.muted);
+          muteCameraForTalk();
         };
         await pc.setLocalDescription(await pc.createOffer());
         await new Promise(resolve => {

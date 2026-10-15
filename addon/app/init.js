@@ -113,10 +113,11 @@ async function detectLanguage(availableLangs) {
   }, { passive: false });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopLiveCamera();
+    if (document.hidden) { stopCameraTalk(); stopLiveCamera(); }
   });
 
   document.getElementById("btn-close-device").addEventListener("click", () => {
+    stopCameraTalk();
     stopLiveCamera();
     document.getElementById("modal-device").classList.remove("open");
   });
@@ -256,7 +257,7 @@ async function detectLanguage(availableLangs) {
       // Recording modal needs its own close path so a click-outside while
       // actively recording actually stops the mic stream, not just hides it.
       if (bd.id === "modal-record-audio") { closeRecordAudioModal(); return; }
-      if (bd.id === "modal-device") stopLiveCamera();
+      if (bd.id === "modal-device") { stopCameraTalk(); stopLiveCamera(); }
       bd.classList.remove("open");
       stopCapturePolling();
     });

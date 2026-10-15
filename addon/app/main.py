@@ -13,6 +13,7 @@ import uuid
 from aiohttp import web
 
 import camera
+import camera_talk
 import devices
 import ha_api
 import mosquitto
@@ -425,6 +426,7 @@ async def handle_api_device_delete(request):
     mqtt_user = deleted_cfg.get("mqtt_user", "") if remove_creds else ""
     mqtt_pass = deleted_cfg.get("mqtt_pass", "") if remove_creds else ""
 
+    await camera_talk.stop_device(serial)
     await camera.stop_device(serial)
     await devices.retract_ha_discovery(serial, deleted_cfg, deleted_state)
     storage.delete_device(serial)
@@ -1135,6 +1137,7 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
+    await camera_talk.stop_all()
     await camera.stop_bridge()
 
 
@@ -1185,6 +1188,7 @@ def main():
     app.router.add_get("/api/devices",                   handle_api_devices_get)
     app.router.add_post("/api/devices/ping",             handle_api_devices_ping)
     app.router.add_get("/api/devices/{serial}/camera/live", handle_api_camera_live)
+    app.router.add_get("/api/devices/{serial}/camera/talk", camera_talk.handle_talk)
     app.router.add_post("/api/devices/{serial}/camera/webrtc", handle_api_camera_webrtc)
     app.router.add_delete("/api/devices/{serial}/camera/webrtc/{session_id}", handle_api_camera_webrtc_close)
     app.router.add_post("/api/devices/{serial}/camera/exposure", handle_api_camera_live_exposure)
