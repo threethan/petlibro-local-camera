@@ -142,7 +142,7 @@ function _aeRenderList() {
       const x = document.createElement("button");
       x.className = "btn-secondary";
       x.style.cssText = "padding:6px 8px;color:var(--pl-danger)";
-      x.textContent = "✕";
+      x.innerHTML = '<span class="material-icons">close</span>';
       x.title = t("animed.del_saved");
       x.onclick = async () => {
         if (!confirm(t("animed.del_confirm", {name: entry.name}))) return;

@@ -57,15 +57,14 @@ let _wizardStep = 0;
 let _capturePolling = null;
 let _lastDeviceRenderKey = "";
 let _lastPetRenderKey = "";
-let _deviceSort = localStorage.getItem("pl_device_sort") || "name";
 
 const DEVICE_ICONS = {
-  dockstream2: "💧",
-  dockstream2_cordless: "💧",
-  dockstream_rfid: "💧",
-  one_rfid: "🐾",
-  granary: "🥣",
-  camera_feeder: "📹",
+  dockstream2: "water_drop",
+  dockstream2_cordless: "water_drop",
+  dockstream_rfid: "water_drop",
+  one_rfid: "pet",
+  granary: "pet",
+  camera_feeder: "pet",
 };
 
 const DEVICE_REQUIRES_PET = {
@@ -290,7 +289,5 @@ function rssiClass(rssi) {
 
 function rssiLabel(rssi) {
   if (rssi == null) return t("signal.none");
-  if (rssi >= -65) return `${rssi} dBm — ${t("signal.good")}`;
-  if (rssi >= -80) return `${rssi} dBm — ${t("signal.fair")}`;
-  return `${rssi} dBm — ${t("signal.poor")}`;
+  return `${rssi} dBm`;
 }

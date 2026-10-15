@@ -49,20 +49,20 @@ Display hours, sound hours and the schedule pause and skip controls are in the a
 
 ## Granary and Smart Camera Feeders
 
-The Smart Camera Feeder exposes the same entities as the Granary; its commands use the `PLAF203` MQTT model instead of `PLAF103`.
+The Smart Camera Feeder exposes the Granary entities except Buttons Lock; its commands use the `PLAF203` MQTT model instead of `PLAF103`.
 
 | Entity | Type | Description |
 |--------|------|-------------|
 | Feed Now | Button | Dispenses one portion immediately |
 | Volume | Number (slider) | Speaker volume 0-100 |
 | Light | Switch | The feeder's indicator light |
-| Buttons Lock | Switch (config) | Locks the feeder's physical buttons |
+| Buttons Lock | Switch (config) | Locks the feeder's physical buttons (Granary only) |
 | Battery | Sensor | Battery charge in percent |
 | Last Fed | Sensor | Timestamp of the last dispense |
 | Next Meal | Sensor (diagnostic) | Timestamp of the next enabled scheduled feeding |
 | Desiccant Days Remaining | Sensor (diagnostic) | Days until desiccant replacement is due |
 
-The PLAF203 Smart Camera Feeder also creates a **Camera** entity. It receives a fresh JPEG snapshot about every five seconds while both `cameraSwitch` and `enableCamera` are on. Snapshots use the feeder's direct-LAN H.264 path; they stop when the feeder camera is disabled. This is a periodically refreshed image, not a continuous WebRTC player.
+The PLAF203 Smart Camera Feeder creates a snapshot **Camera** entity that receives a fresh JPEG about every five seconds while both `cameraSwitch` and `enableCamera` are on. In the web UI's Camera tab, enable **Live Camera in Home Assistant** to add a separate stream-capable camera entity; turn it off to remove that entity. The Petlibro Local - Live Camera Bridge custom integration must be installed and added to Home Assistant once. The toggle controls a go2rtc RTSP source reachable from Home Assistant's Supervisor network.
 
 ## Fountains (Dockstream 2 and the other fountain models)
 

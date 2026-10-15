@@ -24,7 +24,7 @@ _MODEL_NAMES = {
     "dockstream_rfid":      "Dockstream RFID Smart Fountain",
     "one_rfid":             "One RFID Smart Feeder",
     "granary":              "Granary Smart Feeder",
-    "camera_feeder":        "Petlibro Granary with Camera",
+    "camera_feeder":        "Granary Camera Smart Feeder",
 }
 
 _FOUNTAIN_TYPES = {"dockstream2", "dockstream2_cordless", "dockstream_rfid"}
@@ -95,6 +95,12 @@ def camera_image_topic(serial: str) -> str:
 
 def camera_availability_topic(serial: str) -> str:
     return f"{_STATE_PREFIX}/{serial}/camera/availability"
+
+def live_camera_discovery_topic(serial: str) -> str:
+    return f"{_STATE_PREFIX}/camera_live/{serial}/config"
+
+def detection_event_topic(serial: str, detection_type: str) -> str:
+    return f"{_STATE_PREFIX}/{serial}/{detection_type}_detection/event"
 
 def _oid(serial: str, key: str) -> str:
     """Globally unique ID — full serial keeps it collision-free."""
@@ -229,7 +235,7 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
         })))
 
         entities.append(("switch", "light", _e(serial, "light", b, {
-            "name":          "Light",
+            "name":          "Indicator Lights",
             "state_topic":   state_topic(serial, "light"),
             "command_topic": cmd_topic(serial, "light"),
             "payload_on":    "ON",
@@ -405,7 +411,7 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
         })))
 
         entities.append(("switch", "light", _e(serial, "light", b, {
-            "name":          "Light",
+            "name":          "Indicator Lights",
             "state_topic":   state_topic(serial, "light"),
             "command_topic": cmd_topic(serial, "light"),
             "payload_on":    "ON",
@@ -413,15 +419,16 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
             "icon":          "mdi:lightbulb",
         })))
 
-        entities.append(("switch", "buttons_lock", _e(serial, "buttons_lock", b, {
-            "name":            "Buttons Lock",
-            "state_topic":     state_topic(serial, "buttons_lock"),
-            "command_topic":   cmd_topic(serial, "buttons_lock"),
-            "payload_on":      "ON",
-            "payload_off":     "OFF",
-            "icon":            "mdi:lock",
-            "entity_category": "config",
-        })))
+        if device_type != "camera_feeder":
+            entities.append(("switch", "buttons_lock", _e(serial, "buttons_lock", b, {
+                "name":            "Buttons Lock",
+                "state_topic":     state_topic(serial, "buttons_lock"),
+                "command_topic":   cmd_topic(serial, "buttons_lock"),
+                "payload_on":      "ON",
+                "payload_off":     "OFF",
+                "icon":            "mdi:lock",
+                "entity_category": "config",
+            })))
 
         entities.append(("number", "volume", _e(serial, "volume", b, {
             "name":          "Volume",
@@ -435,6 +442,16 @@ def _entity_configs(serial: str, cfg: dict, state: dict, extra_icon_names: list[
         })))
 
         if device_type == "camera_feeder":
+            for detection_type, label, icon in (
+                ("motion", "Motion detected", "mdi:motion-sensor"),
+                ("sound", "Sound detected", "mdi:ear-hearing"),
+            ):
+                entities.append(("event", f"{detection_type}_detection", _e(serial, f"{detection_type}_detection", b, {
+                    "name": label,
+                    "state_topic": detection_event_topic(serial, detection_type),
+                    "event_types": ["detected"],
+                    "icon": icon,
+                })))
             camera_base = {
                 "unique_id": _oid(serial, "camera"),
                 "object_id": _obj_id(serial, "camera"),
@@ -461,12 +478,38 @@ async def publish_discovery(client, serial: str, cfg: dict, state: dict, extra_i
     _LOGGER.info("Discovery: published %d entities for %s...", len(configs), serial[:6])
 
 
+async def publish_live_camera_discovery(serial: str, cfg: dict, state: dict, stream_source: str) -> None:
+    """Register a stream-only live camera for the optional native HA integration."""
+    import devices
+    client = devices._client_ref
+    if client is None:
+        raise RuntimeError("MQTT is not connected")
+    payload = {
+        "serial": serial,
+        "unique_id": _oid(serial, "camera_live"),
+        "name": "Live Camera",
+        "stream_source": stream_source,
+        "availability_topic": camera_availability_topic(serial),
+        "device": _device_block(serial, cfg, state),
+    }
+    await client.publish(live_camera_discovery_topic(serial), json.dumps(payload), retain=True)
+
+
+async def remove_live_camera_discovery(serial: str) -> None:
+    import devices
+    client = devices._client_ref
+    if client is not None:
+        await client.publish(live_camera_discovery_topic(serial), "", retain=True)
+
+
 async def retract_legacy_entities(client, serial: str, cfg: dict):
     """Retract HA discovery topics for entities removed in previous versions."""
     device_type = cfg.get("device_type", "")
     stale: list[tuple[str, str]] = []
     if device_type == "one_rfid":
         stale.append(("switch", "light"))
+    if device_type == "camera_feeder":
+        stale.append(("switch", "buttons_lock"))
     for component, key in stale:
         topic = _disc_topic(component, serial, key)
         await client.publish(topic, "", retain=True)
@@ -486,6 +529,19 @@ async def retract_discovery(client, serial: str, cfg: dict, state: dict):
 async def publish_availability(client, serial: str, online: bool):
     """Publish online/offline to the device availability topic."""
     await client.publish(avail_topic(serial), "online" if online else "offline", retain=True)
+
+
+async def publish_detection_event(client, serial: str, detection_type: str, data: dict):
+    """Publish one camera detection as a transient Home Assistant MQTT event."""
+    if detection_type not in ("motion", "sound"):
+        return
+    payload = {
+        "event_type": "detected",
+        "detection_type": detection_type,
+        "timestamp": data.get("ts"),
+        "message_id": data.get("msgId"),
+    }
+    await client.publish(detection_event_topic(serial, detection_type), json.dumps(payload), retain=False)
 
 
 # ── Command routing ────────────────────────────────────────────────────────
@@ -508,7 +564,8 @@ def get_command_topics(serial: str, device_type: str) -> list[str]:
         topics.append(cmd_topic(serial, "feed_now"))
         topics.append(cmd_topic(serial, "volume"))
         topics.append(cmd_topic(serial, "light"))
-        topics.append(cmd_topic(serial, "buttons_lock"))
+        if device_type == "granary":
+            topics.append(cmd_topic(serial, "buttons_lock"))
     return topics
 
 
@@ -714,7 +771,7 @@ async def publish_state(client, serial: str, cfg: dict, state: dict, plans: list
             val = "ON" if state["lightSwitch"] == 1 else "OFF"
             await client.publish(state_topic(serial, "light"), val, retain=True)
 
-        if "disableHardwareButton" in state:
+        if "disableHardwareButton" in state and cfg.get("device_type") != "camera_feeder":
             val = "ON" if state["disableHardwareButton"] else "OFF"
             await client.publish(state_topic(serial, "buttons_lock"), val, retain=True)
 

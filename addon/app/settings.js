@@ -147,6 +147,7 @@ function wireAudioSettingsControls() {
   const recordBtn  = document.getElementById("btn-audio-record");
   const nameInput  = document.getElementById("audio-new-name");
   const statusEl   = document.getElementById("audio-status");
+  const refreshUrlBtn = document.getElementById("btn-refresh-local-audio-url");
 
   if (uploadBtn && fileInput) {
     uploadBtn.onclick = () => fileInput.click();
@@ -162,10 +163,44 @@ function wireAudioSettingsControls() {
     };
   }
 
-  if (recordBtn) recordBtn.onclick = openRecordAudioModal;
+  if (recordBtn) {
+    const canRecordAudio = Boolean(navigator.mediaDevices?.getUserMedia);
+    recordBtn.hidden = !canRecordAudio;
+    if (canRecordAudio) recordBtn.onclick = openRecordAudioModal;
+  }
+  if (refreshUrlBtn) refreshUrlBtn.onclick = () => refreshLocalAudioUrlSuggestion(false);
 
   const closeRecordBtn = document.getElementById("btn-close-record-audio");
   if (closeRecordBtn) closeRecordBtn.onclick = closeRecordAudioModal;
+}
+
+async function refreshLocalAudioUrlSuggestion(onlyIfEmpty) {
+  const input = document.getElementById("s-local-audio-base-url");
+  const button = document.getElementById("btn-refresh-local-audio-url");
+  const status = document.getElementById("local-audio-url-status");
+  if (!input || (onlyIfEmpty && input.value.trim())) return;
+  if (button) button.disabled = true;
+  if (status) { status.className = "mqtt-status"; status.textContent = ""; }
+  try {
+    const suggestion = await api("GET", "/api/settings/local-audio-url-suggestion");
+    if (!suggestion.url) throw new Error(t("settings.local_audio_base_url_unavailable"));
+    // The automatic request must not replace a value the user entered while
+    // the server was resolving the address. An explicit refresh may replace it.
+    if (!onlyIfEmpty || !input.value.trim()) {
+      input.value = suggestion.url;
+      if (status) {
+        status.className = "mqtt-status ok";
+        status.textContent = t("settings.local_audio_base_url_suggested");
+      }
+    }
+  } catch (e) {
+    if (status) {
+      status.className = "mqtt-status fail";
+      status.textContent = t("settings.local_audio_base_url_unavailable");
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 // ── Record Sound modal ───────────────────────────────────────────────────
@@ -266,7 +301,10 @@ function renderSettings() {
   }
   const bellCb = document.getElementById("s-notify-bell");
   if (bellCb) bellCb.checked = _settings.notify_bell_enabled !== false;
-
+  const devicePingCb = document.getElementById("s-device-ping-enabled");
+  if (devicePingCb) devicePingCb.checked = _settings.device_ping_enabled !== false;
+  const cameraAutoStartEl = document.getElementById("s-camera-auto-start");
+  if (cameraAutoStartEl) cameraAutoStartEl.checked = _settings.camera_auto_start_live_view === true;
   const emailTo = document.getElementById("s-notify-email-to");
   if (emailTo) emailTo.value = _settings.notify_email_to || "";
 
@@ -285,18 +323,32 @@ function renderSettings() {
       if (opt.value === tzVal) { opt.selected = true; break; }
     }
   }
+  const cameraIntervalEl = document.getElementById("s-camera-snapshot-interval");
+  if (cameraIntervalEl) {
+    cameraIntervalEl.value = _settings.camera_snapshot_interval_secs ?? 15;
+  }
+  const vp8TranscodingEl = document.getElementById("s-camera-vp8-transcoding");
+  if (vp8TranscodingEl) vp8TranscodingEl.checked = _settings.camera_vp8_transcoding === true;
   const audioUrlEl = document.getElementById("s-local-audio-base-url");
   if (audioUrlEl) audioUrlEl.value = _settings.local_audio_base_url || "";
+  if (audioUrlEl && !audioUrlEl.value.trim()) refreshLocalAudioUrlSuggestion(true);
 }
 
-
 async function saveSettings(fromTab) {
+  const cameraIntervalEl = document.getElementById("s-camera-snapshot-interval");
+  if (cameraIntervalEl && !cameraIntervalEl.checkValidity()) {
+    if (fromTab !== "camera") switchSettingsTab("camera");
+    cameraIntervalEl.reportValidity();
+    return;
+  }
   const body = {
     mqtt_host: document.getElementById("s-mqtt-host").value.trim(),
     mqtt_port: parseInt(document.getElementById("s-mqtt-port").value) || 1883,
     mqtt_user: document.getElementById("s-mqtt-user").value.trim(),
     mqtt_pass: document.getElementById("s-mqtt-pass").value,
     language: document.getElementById("s-language").value,
+    device_ping_enabled: document.getElementById("s-device-ping-enabled")?.checked !== false,
+    camera_auto_start_live_view: document.getElementById("s-camera-auto-start")?.checked === true,
     units: document.getElementById("s-units").value,
     feeder_timezone: document.getElementById("s-feeder-tz")?.value || "America/Denver",
     notify_bell_enabled: document.getElementById("s-notify-bell")?.checked !== false,
@@ -304,6 +356,8 @@ async function saveSettings(fromTab) {
     notify_email_to: (document.getElementById("s-notify-email-to")?.value || "").trim(),
     notify_mobile_default_service: document.getElementById("s-notify-mobile-service")?.value || "",
     local_audio_base_url: (document.getElementById("s-local-audio-base-url")?.value || "").trim(),
+    camera_snapshot_interval_secs: Number(cameraIntervalEl?.value || 15),
+    camera_vp8_transcoding: document.getElementById("s-camera-vp8-transcoding")?.checked === true,
   };
   const statusEl = document.getElementById("mqtt-status");
   statusEl.className = "mqtt-status";
@@ -324,6 +378,41 @@ async function saveSettings(fromTab) {
     _lastDeviceRenderKey = "";
     renderDevices();
   } catch(e) { alert(t("settings.save_failed", {error: e.message})); }
+}
+
+async function autoAddMqttLogin() {
+  const button = document.getElementById("btn-auto-mqtt");
+  const statusEl = document.getElementById("mqtt-auto-status");
+  if (!confirm(t("settings.mqtt_auto_confirm"))) return;
+  button.disabled = true;
+  statusEl.className = "mqtt-status";
+  try {
+    const result = await api("POST", "/api/settings/mqtt-auto-add", {});
+    if (result.status === "not_installed") {
+      statusEl.className = "mqtt-status fail";
+      statusEl.textContent = t("settings.mqtt_auto_not_installed");
+      return;
+    }
+    if (result.status === "not_started") {
+      statusEl.className = "mqtt-status fail";
+      statusEl.textContent = t("settings.mqtt_auto_not_started");
+      return;
+    }
+    if (result.status !== "ok") throw new Error(result.detail || "Mosquitto setup failed");
+
+    document.getElementById("s-mqtt-user").value = result.username;
+    document.getElementById("s-mqtt-pass").value = result.password;
+    if (!document.getElementById("s-mqtt-host").value.trim()) document.getElementById("s-mqtt-host").value = "localhost";
+    if (!document.getElementById("s-mqtt-port").value) document.getElementById("s-mqtt-port").value = "1883";
+    statusEl.className = "mqtt-status ok";
+    statusEl.textContent = t("settings.mqtt_auto_added");
+    await saveSettings("mqtt");
+  } catch (e) {
+    statusEl.className = "mqtt-status fail";
+    statusEl.textContent = t("settings.mqtt_auto_error", {error: e.message});
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadLanguages() {

@@ -32,6 +32,30 @@ async function pollRefresh() {
   // Never re-render settings while user may be typing
 }
 
+let _devicePingInFlight = false;
+async function pingVisibleDevices() {
+  if (document.hidden || _settings.device_ping_enabled === false || _devicePingInFlight) return;
+  _devicePingInFlight = true;
+  try {
+    _devices = await api("POST", "/api/devices/ping");
+    renderDevices();
+    checkAlerts();
+    if (_currentDevice) {
+      const device = _devices.find(d => d.serial === _currentDevice.serial);
+      if (device) {
+        _currentDevice = device;
+        const badge = document.getElementById("detail-status-badge");
+        badge.textContent = device.online ? t("device.online") : t("device.offline");
+        badge.className = `status-badge ${device.online ? "online" : "offline"}`;
+      }
+    }
+  } catch (error) {
+    console.error("Device ping failed", error);
+  } finally {
+    _devicePingInFlight = false;
+  }
+}
+
 // ── Utils ─────────────────────────────────────────────────────────────────
 function escHtml(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -78,7 +102,25 @@ async function detectLanguage(availableLangs) {
   });
 
   // Wire device modal
+  const deviceTabs = document.getElementById("device-tabs");
+  deviceTabs.addEventListener("wheel", event => {
+    if (deviceTabs.scrollWidth <= deviceTabs.clientWidth) return;
+
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    const maxScroll = deviceTabs.scrollWidth - deviceTabs.clientWidth;
+    const nextScroll = Math.max(0, Math.min(maxScroll, deviceTabs.scrollLeft + delta));
+    if (nextScroll !== deviceTabs.scrollLeft) {
+      event.preventDefault();
+      deviceTabs.scrollLeft = nextScroll;
+    }
+  }, { passive: false });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopLiveCamera();
+  });
+
   document.getElementById("btn-close-device").addEventListener("click", () => {
+    stopLiveCamera();
     document.getElementById("modal-device").classList.remove("open");
   });
   document.querySelectorAll(".dtab").forEach(btn => {
@@ -115,6 +157,7 @@ async function detectLanguage(availableLangs) {
     document.getElementById("modal-edit-device").classList.remove("open");
   });
   document.getElementById("btn-edit-save").addEventListener("click", saveEditDevice);
+  document.getElementById("btn-edit-remove").addEventListener("click", () => deleteDevice(_currentDevice.serial));
 
   // Wire add device
   document.getElementById("btn-close-add").addEventListener("click", () => {
@@ -154,7 +197,7 @@ async function detectLanguage(availableLangs) {
     const input = document.getElementById(btn.dataset.target);
     if (!input) return;
     input.type = input.type === "password" ? "text" : "password";
-    btn.textContent = input.type === "password" ? "👁" : "🙈";
+    btn.innerHTML = input.type === "password" ? '<span class="material-icons">visibility</span>' : '<span class="material-icons">visibility_off</span>';
   });
 
   document.getElementById("btn-about").addEventListener("click", openAbout);
@@ -193,7 +236,9 @@ async function detectLanguage(availableLangs) {
   document.getElementById("btn-save-general").addEventListener("click", () => saveSettings("general"));
   document.getElementById("btn-save-notifications").addEventListener("click", () => saveSettings("notifications"));
   document.getElementById("btn-save-mqtt").addEventListener("click", () => saveSettings("mqtt"));
+  document.getElementById("btn-auto-mqtt").addEventListener("click", autoAddMqttLogin);
   document.getElementById("btn-save-audio-settings").addEventListener("click", () => saveSettings("audio"));
+  document.getElementById("btn-save-camera").addEventListener("click", () => saveSettings("camera"));
   wireAudioSettingsControls();
   document.getElementById("btn-banner-mqtt").addEventListener("click", () => {
     switchTab("settings");
@@ -202,12 +247,6 @@ async function detectLanguage(availableLangs) {
   document.getElementById("btn-banner-pets").addEventListener("click", () => {
     switchTab("pets");
     openPetModal(null);
-  });
-  document.getElementById("device-sort-select").addEventListener("change", e => {
-    _deviceSort = e.target.value;
-    localStorage.setItem("pl_device_sort", _deviceSort);
-    _lastDeviceRenderKey = "";
-    renderDevices();
   });
   document.getElementById("btn-bell").addEventListener("click", toggleAlertPanel);
   document.getElementById("fab-add-device").addEventListener("click", openAddDevice);
@@ -220,6 +259,7 @@ async function detectLanguage(availableLangs) {
       // Recording modal needs its own close path so a click-outside while
       // actively recording actually stops the mic stream, not just hides it.
       if (bd.id === "modal-record-audio") { closeRecordAudioModal(); return; }
+      if (bd.id === "modal-device") stopLiveCamera();
       bd.classList.remove("open");
       stopCapturePolling();
     });
@@ -227,17 +267,15 @@ async function detectLanguage(availableLangs) {
 
   // Initial load
   await loadAll();
-  populateSortSelect();
   renderDevices();
   renderPets();
   renderSettings();
   checkAlerts();
   checkMqttSetup();
   checkPetSetup();
-  // If MQTT is set up, devices exist, but no pets have been added yet, nudge user to Pets tab
-  if (isMqttConfigured() && _devices.length > 0 && _pets.length === 0) {
-    switchTab("pets");
-  }
 
   setInterval(pollRefresh, 8000);
+  document.addEventListener("visibilitychange", pingVisibleDevices);
+  setInterval(pingVisibleDevices, 5000);
+  pingVisibleDevices();
 })();

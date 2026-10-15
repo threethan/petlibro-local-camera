@@ -1,0 +1,51 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+
+function render(device) {
+  const scope = vm.createContext({
+    t: key => key,
+    escHtml: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
+    _utcToLocal: value => value,
+    device,
+  });
+  vm.runInContext(readFileSync(new URL('../addon/app/modal-device.js', import.meta.url), 'utf8'), scope);
+  return vm.runInContext('buildCameraSettingsTab(device, "sensors")', scope);
+}
+
+test('camera settings expose recording modes, hours and feeding clip parameters', () => {
+  const html = render({videoRecordSwitch: true, videoRecordMode: 'MOTION_DETECTION', videoRecordAgingType: 2,
+    videoRecordStartTimeUtc: '22:00', videoRecordEndTimeUtc: '06:00', feedingVideoSwitch: true});
+  for (const key of ['videoRecordSwitch', 'videoRecordMode', 'videoRecordAgingType', 'videoRecordStartTime',
+    'videoRecordEndTime', 'feedingVideoSwitch', 'enableVideoStartFeedingPlan', 'beforeFeedingPlanTime',
+    'automaticRecording', 'enableVideoAfterManualFeeding', 'afterManualFeedingTime']) {
+    assert.ok(html.includes(`data-camera-setting="${key}"`), key);
+  }
+  assert.ok(html.includes('value="22:00"'));
+  assert.ok(html.includes('value="06:00"'));
+  assert.ok(html.includes('Motion Detection to be enabled'));
+});
+
+test('SD card facts stay read-only and escaped', () => {
+  const html = render({sdCardState: '1', sdCardFileSystem: '<script>bad</script>',
+    sdCardTotalCapacity: '32000', sdCardUsedCapacity: '1000'});
+  assert.ok(html.includes('Available'));
+  assert.ok(html.includes('31000 MB'));
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.ok(!html.includes('<script>'));
+  assert.ok(!html.includes('data-camera-setting="sdCardState"'));
+  assert.ok(render({}).includes('Unknown'));
+});
+
+test('indicator light settings display scheduled hours from UTC reports', () => {
+  const html = render({lightSwitch: true, lightAgingType: 2,
+    lightingStartTimeUtc: '08:00', lightingEndTimeUtc: '22:00'});
+  for (const key of ['lightSwitch', 'lightAgingType', 'lightingStartTime', 'lightingEndTime']) {
+    assert.ok(html.includes(`data-camera-setting="${key}"`), key);
+  }
+  assert.ok(html.includes('Indicator lights'));
+  assert.ok(html.includes('value="08:00"'));
+  assert.ok(html.includes('value="22:00"'));
+  assert.ok(html.includes('data-schedule-times="indicators"'));
+});

@@ -15,9 +15,12 @@ import os
 _LOGGER = logging.getLogger(__name__)
 
 DATA_FILE = "/data/petlibro_local.json"
+CAMERA_SNAPSHOT_INTERVAL_MIN_SECONDS = 1
+CAMERA_SNAPSHOT_INTERVAL_MAX_SECONDS = 300
 
 DEFAULT_SETTINGS = {
     "language": "en",
+    "device_ping_enabled": True,
     "mqtt_host": "localhost",
     "mqtt_port": 1883,
     "mqtt_user": "",
@@ -30,13 +33,17 @@ DEFAULT_SETTINGS = {
     "notify_email_to": "",
     "notify_mobile_default_service": "",
     "local_audio_base_url": "",
+    "camera_snapshot_interval_secs": 15,
+    "camera_vp8_transcoding": False,
+    "camera_auto_start_live_view": False,
 }
 
 ALLOWED_SETTINGS = set(DEFAULT_SETTINGS.keys()) | {"feeder_timezone"}
 
 ALLOWED_DEVICE_FIELDS = {
     "name", "room", "device_type", "model", "image_url", "variant",
-    "mqtt_user", "mqtt_pass", "pet_ids",
+    "mqtt_user", "mqtt_pass", "pet_ids", "live_camera_exposed",
+    "camera_power_with_live_view",
     "filter_life_days", "last_cleaned_ts", "cleaning_interval_days",
     "low_water_grams", "min_drink_grams", "notifications",
     "notify_bell", "notify_email", "notify_email_address",
@@ -81,6 +88,7 @@ _DEVICE_DEFAULTS = {
     "mqtt_user": "",
     "mqtt_pass": "",
     "pet_ids": [],
+    "camera_power_with_live_view": False,
     "filter_life_days": 14,
     "last_cleaned_ts": None,
     "cleaning_interval_days": 14,
@@ -128,6 +136,13 @@ def _load() -> dict:
         data.setdefault("pets", {})
         data.setdefault("settings", {})
         data.setdefault("intake", {})
+        if "camera_power_with_live_view" in data["settings"]:
+            legacy_value = data["settings"].pop("camera_power_with_live_view")
+            if isinstance(legacy_value, bool):
+                for device in data["devices"].values():
+                    if device.get("device_type") == "camera_feeder":
+                        device.setdefault("camera_power_with_live_view", legacy_value)
+            _save(data)
         return data
     except Exception:
         _LOGGER.exception("Failed to load data file, starting fresh")
@@ -158,6 +173,22 @@ def save_settings(updates: dict) -> dict:
     current = {**DEFAULT_SETTINGS, **data.get("settings", {})}
     for key, val in updates.items():
         if key in ALLOWED_SETTINGS:
+            if key == "camera_snapshot_interval_secs":
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise ValueError("Camera snapshot interval must be a whole number of seconds")
+                if not CAMERA_SNAPSHOT_INTERVAL_MIN_SECONDS <= val <= CAMERA_SNAPSHOT_INTERVAL_MAX_SECONDS:
+                    raise ValueError(
+                        "Camera snapshot interval must be between "
+                        f"{CAMERA_SNAPSHOT_INTERVAL_MIN_SECONDS} and "
+                        f"{CAMERA_SNAPSHOT_INTERVAL_MAX_SECONDS} seconds"
+                    )
+            if key in {
+                "camera_vp8_transcoding",
+                "camera_auto_start_live_view",
+                "device_ping_enabled",
+            }:
+                if not isinstance(val, bool):
+                    raise ValueError(f"{key} must be a boolean")
             current[key] = val
     data["settings"] = current
     _save(data)
@@ -180,6 +211,8 @@ def save_device(serial: str, fields: dict) -> dict:
         fields = {k: v for k, v in fields.items() if k != "notifications"}
     for key, val in fields.items():
         if key in ALLOWED_DEVICE_FIELDS:
+            if key == "camera_power_with_live_view" and not isinstance(val, bool):
+                raise ValueError("camera_power_with_live_view must be a boolean")
             devices[serial][key] = val
     devices[serial]["serial"] = serial
     _save(data)

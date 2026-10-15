@@ -96,32 +96,20 @@ async def remove_mosquitto_login(username: str) -> str:
     options_url = f"{SUPERVISOR_URL}/addons/{MOSQUITTO_SLUG}/options"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                info_url,
-                headers=_action_headers(),
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
+            async with session.get(info_url, headers=_action_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     _LOGGER.error("Could not read Mosquitto info: HTTP %d — %s", resp.status, text[:200])
                     return "error"
                 info = await resp.json()
-
         current_opts = info.get("data", {}).get("options", {})
         logins = list(current_opts.get("logins", []))
-        new_logins = [e for e in logins if e.get("username") != username]
+        new_logins = [entry for entry in logins if entry.get("username") != username]
         if len(new_logins) == len(logins):
             _LOGGER.info("Login for %s... not found in Mosquitto (nothing to remove)", username[:4])
             return "not_found"
-
-        new_options = {**current_opts, "logins": new_logins}
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                options_url,
-                json={"options": new_options},
-                headers={**_action_headers(), "Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
+            async with session.post(options_url, json={"options": {**current_opts, "logins": new_logins}}, headers={**_action_headers(), "Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     _LOGGER.info("Removed Mosquitto login for %s...", username[:4])
                     return "removed"
@@ -132,6 +120,55 @@ async def remove_mosquitto_login(username: str) -> str:
         _LOGGER.exception("remove_mosquitto_login failed")
         return "error"
 
+
+async def remove_mosquitto_logins_matching(name: str) -> str:
+    """Remove logins whose username contains the normalized name phrase.
+
+    Hyphens and underscores are treated as spaces, so ``petlibro-local`` and
+    ``Petlibro Local`` both match the phrase ``petlibro local``.
+    Returns "removed", "not_found", or "error".
+    """
+    if not SUPERVISOR_TOKEN:
+        _LOGGER.error("SUPERVISOR_TOKEN is not set")
+        return "error"
+
+    normalize = lambda value: " ".join(
+        str(value).lower().replace("-", " ").replace("_", " ").split()
+    )
+    phrase = normalize(name)
+    info_url = f"{SUPERVISOR_URL}/addons/{MOSQUITTO_SLUG}/info"
+    options_url = f"{SUPERVISOR_URL}/addons/{MOSQUITTO_SLUG}/options"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(info_url, headers=_action_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    _LOGGER.error("Could not read Mosquitto info: HTTP %d — %s", resp.status, text[:200])
+                    return "error"
+                info = await resp.json()
+
+        current_opts = info.get("data", {}).get("options", {})
+        logins = list(current_opts.get("logins", []))
+        new_logins = [entry for entry in logins if phrase not in normalize(entry.get("username", ""))]
+        if len(new_logins) == len(logins):
+            return "not_found"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                options_url,
+                json={"options": {**current_opts, "logins": new_logins}},
+                headers={**_action_headers(), "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    _LOGGER.info("Removed %d Mosquitto login(s) matching %s", len(logins) - len(new_logins), name)
+                    return "removed"
+                text = await resp.text()
+                _LOGGER.error("Failed to save Mosquitto options: HTTP %d — %s", resp.status, text[:200])
+                return "error"
+    except Exception:
+        _LOGGER.exception("remove_mosquitto_logins_matching failed")
+        return "error"
 
 async def add_mosquitto_login(username: str, password: str) -> str:
     """Add a login entry to Mosquitto's options and save.

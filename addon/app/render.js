@@ -2,38 +2,11 @@
 function _sortedDevices() {
   const list = [..._devices];
   const byName = (a, b) => (a.name || a.device_type || "").localeCompare(b.name || b.device_type || "");
-  if (_deviceSort === "name") {
-    list.sort(byName);
-  } else if (_deviceSort === "room") {
-    list.sort((a, b) => {
-      const ra = a.room || "￿", rb = b.room || "￿";
-      return ra.localeCompare(rb) || byName(a, b);
-    });
-  } else if (_deviceSort.startsWith("pet_")) {
-    const petId = _deviceSort.slice(4);
-    // 0 = only this pet, 1 = shared (this + others), 2 = other pets only, 3 = no pets
-    const score = d => {
-      const ids = d.pet_ids || [];
-      if (ids.length === 0) return 3;
-      if (ids.includes(petId) && ids.length === 1) return 0;
-      if (ids.includes(petId)) return 1;
-      return 2;
-    };
-    list.sort((a, b) => (score(a) - score(b)) || byName(a, b));
-  }
+  list.sort((a, b) => {
+    const ra = a.room || "￿", rb = b.room || "￿";
+    return ra.localeCompare(rb) || byName(a, b);
+  });
   return list;
-}
-
-function populateSortSelect() {
-  const sel = document.getElementById("device-sort-select");
-  if (!sel) return;
-  const cur = _deviceSort;
-  sel.innerHTML = `<option value="name">${t("header.sort_name")}</option><option value="room">${t("header.sort_room")}</option>` +
-    _pets.map(p => `<option value="pet_${p.id}">${escHtml(p.name)}</option>`).join("");
-  const valid = Array.from(sel.options).map(o => o.value);
-  _deviceSort = valid.includes(cur) ? cur : "name";
-  sel.value = _deviceSort;
-  if (_deviceSort !== cur) localStorage.setItem("pl_device_sort", _deviceSort);
 }
 
 function renderDevices() {
@@ -46,7 +19,7 @@ function renderDevices() {
     plans: (d.feeding_plans||[]).map(p=>p.executionTime+"_"+(p._enabled!==false?1:0)).join(),
     dt: d.display_text, din: d.display_icon_name, di: d.display_icon,
     pets: (d.pets || []).map(p => `${p.id}:${p.image_url}:${p.name}`).join(),
-    units: _settings.units, sort: _deviceSort,
+    units: _settings.units,
   })));
   if (key === _lastDeviceRenderKey) return;
   _lastDeviceRenderKey = key;
@@ -54,7 +27,7 @@ function renderDevices() {
   const grid = document.getElementById("device-grid");
   if (!_devices.length) {
     grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
-      <div class="empty-icon">🥣</div>
+      <div class="empty-icon"><span class="material-icons">hub</span></div>
       <div class="empty-msg">${t("device.none")}</div>
     </div>`;
     return;
@@ -73,7 +46,7 @@ function renderDevices() {
       : "");
     const imgHtml = imageUrl
       ? `<img src="${escHtml(imageUrl)}" alt="">`
-      : `<div class="card-img-placeholder">${icon}</div>`;
+      : `<div class="card-img-placeholder"><span class="material-icons">${icon}</span></div>`;
     const allPets = d.pets || [];
     const maxPetSlots = 5;
     let shownPets = allPets, petOverflow = 0;
@@ -84,7 +57,7 @@ function renderDevices() {
     const petsHtml = shownPets.map(p =>
       p.image_url
         ? `<div class="card-pet-avatar"><img src="${escHtml(p.image_url)}" alt="${escHtml(p.name)}"></div>`
-        : `<div class="card-pet-avatar">🐾</div>`
+        : `<div class="card-pet-avatar"><span class="material-icons">pets</span></div>`
     ).join("") + (petOverflow > 0 ? `<div class="card-pet-avatar card-pet-overflow">+${petOverflow}</div>` : "");
     const alerts = deviceAlerts(d);
     const alertDot = alerts.length ? `<div class="card-alert" title="${escHtml(alerts.map(alertLabel).join(', '))}">!</div>` : "";

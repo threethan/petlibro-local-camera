@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
@@ -11,6 +12,10 @@ _LOGGER = logging.getLogger(__name__)
 
 _BRIDGE_API = "http://127.0.0.1:8081"
 _RTSP_URL = "rtsp://127.0.0.1:8554/device/{serial}"
+_GO2RTC_API = "http://127.0.0.1:11984"
+_HA_RTSP_HOST = "172.30.32.1"
+_HA_RTSP_PORT = 18556
+_GO2RTC_WEBRTC = f"{_GO2RTC_API}/api/webrtc?src={{serial}}"
 _SNAPSHOT_INTERVAL_SECS = 5
 _STREAM_READ_TIMEOUT_SECS = 25
 _MAX_JPEG_BYTES = 2 * 1024 * 1024
@@ -21,12 +26,69 @@ _http: aiohttp.ClientSession | None = None
 _bridge_process: asyncio.subprocess.Process | None = None
 _tasks: dict[str, asyncio.Task] = {}
 _registered_uids: dict[str, str] = {}
+_live_exposed: set[str] = set()
 _camera_available: dict[str, bool] = {}
+_live_serial: str | None = None
+_live_process: asyncio.subprocess.Process | None = None
+_go2rtc_process: asyncio.subprocess.Process | None = None
+_rtsp_loopback_server: asyncio.Server | None = None
+_rtsp_loopback_tasks: set[asyncio.Task] = set()
+_webrtc_sessions: dict[str, str] = {}
+
+
+def live_stream_available(serial: str) -> bool:
+    """Return whether this feeder is registered and the single live slot is free."""
+    return bool(
+        _SERIAL_RE.fullmatch(serial)
+        and serial in _registered_uids
+        and _bridge_process is not None
+        and _bridge_process.returncode is None
+        and _live_serial is None
+    )
+
+
+async def live_frames(serial: str):
+    """Yield low-rate JPEG frames for one explicitly requested live viewer."""
+    global _live_serial, _live_process
+    if not live_stream_available(serial):
+        raise RuntimeError("Camera is not registered or the live viewer is busy")
+    _live_serial = serial
+    process = None
+    stderr_task = None
+    stderr_tail = bytearray()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-rtsp_transport", "tcp", "-i", _RTSP_URL.format(serial=serial),
+            "-an", "-vf", "fps=30,scale='min(960,iw)':-2", "-q:v", "7",
+            "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _live_process = process
+        stderr_task = asyncio.create_task(_drain_stderr(process.stderr, stderr_tail))
+        async for frame in _jpeg_frames(process.stdout):
+            yield frame
+        await process.wait()
+        if stderr_task:
+            await stderr_task
+            stderr_task = None
+        detail = stderr_tail.decode("utf-8", errors="replace").strip()[-1000:]
+        raise RuntimeError(f"FFmpeg stream ended ({process.returncode}): {detail or 'no diagnostic output'}")
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        if stderr_task:
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        _live_process = None
+        _live_serial = None
 
 
 async def start_bridge() -> bool:
     """Start the pinned camera bridge, bound to loopback only."""
-    global _http, _bridge_process
+    global _http, _bridge_process, _go2rtc_process
     if _http is None or _http.closed:
         _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
     if _bridge_process is None or _bridge_process.returncode is not None:
@@ -45,6 +107,11 @@ async def start_bridge() -> bool:
             _LOGGER.exception("Could not start PLAF203 camera bridge")
             return False
 
+    try:
+        await _start_go2rtc()
+    except Exception:
+        _LOGGER.exception("Could not start go2rtc WebRTC server")
+
     for _ in range(20):
         if _bridge_process.returncode is not None:
             _LOGGER.error("PLAF203 camera bridge exited with status %s", _bridge_process.returncode)
@@ -61,9 +128,212 @@ async def start_bridge() -> bool:
     return False
 
 
+async def _forward_rtsp_loopback(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Forward go2rtc's FFmpeg callback to its Supervisor-only RTSP socket."""
+    task = asyncio.current_task()
+    _rtsp_loopback_tasks.add(task)
+    upstream_writer = None
+    pumps = []
+
+    async def copy(source, destination):
+        while data := await source.read(65536):
+            destination.write(data)
+            await destination.drain()
+
+    try:
+        upstream_reader, upstream_writer = await asyncio.wait_for(
+            asyncio.open_connection(_HA_RTSP_HOST, _HA_RTSP_PORT), timeout=5,
+        )
+        pumps = [
+            asyncio.create_task(copy(reader, upstream_writer)),
+            asyncio.create_task(copy(upstream_reader, writer)),
+        ]
+        await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+    except (OSError, asyncio.TimeoutError):
+        _LOGGER.warning("Could not connect FFmpeg to go2rtc's RTSP listener", exc_info=True)
+    finally:
+        for pump in pumps:
+            pump.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+        writers = [writer] + ([upstream_writer] if upstream_writer is not None else [])
+        for connection in writers:
+            connection.close()
+        await asyncio.gather(*(connection.wait_closed() for connection in writers), return_exceptions=True)
+        _rtsp_loopback_tasks.discard(task)
+
+
+async def _stop_rtsp_loopback() -> None:
+    global _rtsp_loopback_server
+    server = _rtsp_loopback_server
+    _rtsp_loopback_server = None
+    if server is not None:
+        server.close()
+    tasks = list(_rtsp_loopback_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if server is not None:
+        await server.wait_closed()
+
+
+async def _start_go2rtc() -> None:
+    global _go2rtc_process
+    global _rtsp_loopback_server
+    # go2rtc's exec producer always publishes FFmpeg output to 127.0.0.1.
+    # Keep the main listener restricted to the Supervisor interface and
+    # provide that internal callback without binding RTSP on LAN interfaces.
+    if _rtsp_loopback_server is None:
+        _rtsp_loopback_server = await asyncio.start_server(
+            _forward_rtsp_loopback, "127.0.0.1", _HA_RTSP_PORT,
+        )
+    if _go2rtc_process is not None and _go2rtc_process.returncode is None:
+        return
+    config = "/data/go2rtc.yaml"
+    with open(config, "w", encoding="utf-8") as stream:
+        stream.write(
+            'api:\n'
+            '  listen: "127.0.0.1:11984"\n'
+            'rtsp:\n'
+            '  listen: "172.30.32.1:18556"\n'
+            'webrtc:\n'
+            '  listen: ":18555"\n'
+            'ffmpeg:\n'
+            # The bridge can be probed as 90,000 fps (its RTP clock rate).
+            # Bound the encoder cadence explicitly so FFmpeg cannot duplicate
+            # the first decoded image at that rate and fall behind live video.
+            '  vp8: "-r 15 -fps_mode cfr -c:v libvpx -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 15 -keyint_min 15 -b:v 1200k -pix_fmt yuv420p"\n'
+            # Keep FFmpeg's RTSP probe buffer enabled for transcoding:
+            # nobuffer can discard the first fresh IDR's SPS/PPS before the
+            # decoder has configured itself.
+            '  vp8input: "-flags low_delay -timeout {timeout} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -analyzeduration 1000000 -probesize 1000000 -i {input}"\n'
+            'streams: {}\n'
+        )
+    _go2rtc_process = await asyncio.create_subprocess_exec(
+        "/usr/local/bin/go2rtc", "-config", config,
+    )
+    for _ in range(40):
+        if _go2rtc_process.returncode is not None:
+            raise RuntimeError("go2rtc exited during startup")
+        try:
+            async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
+                if response.status == 200:
+                    return
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        await asyncio.sleep(0.25)
+    raise RuntimeError("go2rtc did not become healthy")
+
+
+async def exchange_webrtc(serial: str, offer: bytes) -> tuple[bytes, str | None]:
+    if serial not in _registered_uids or _http is None:
+        raise RuntimeError("Camera is not registered")
+    stream_name = f"plaf203_{serial}"
+    import storage
+
+    settings = storage.get_settings()
+    raw_source = _RTSP_URL.format(serial=serial)
+    sources = [raw_source]
+    if settings.get("camera_vp8_transcoding", False):
+        sources.append(f"exec:ffmpeg -flags low_delay -timeout {{timeout}} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -analyzeduration 1000000 -probesize 1000000 -i {raw_source} -r 15 -fps_mode cfr -c:v libvpx -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 15 -keyint_min 15 -b:v 1200k -pix_fmt yuv420p -an -user_agent ffmpeg/go2rtc -rtsp_transport tcp -f rtsp {{output}}")
+    sources.append(f"ffmpeg:{stream_name}#audio=opus")
+    params = [("name", stream_name)]
+    params.extend(("src", source) for source in sources)
+    async with _http.put(
+        f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
+    ) as response:
+        registration_status = response.status
+        registration_detail = (await response.text())[:300] if registration_status >= 400 else ""
+    # go2rtc may report a config persistence error after adding the stream to
+    # memory (for example with a read-only config). Match the relay: the live
+    # stream list determines whether registration succeeded.
+    async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
+        if response.status != 200:
+            raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
+        streams = await response.json()
+    if not isinstance(streams, dict) or stream_name not in streams:
+        detail = f": {registration_detail}" if registration_detail else ""
+        raise RuntimeError(f"go2rtc did not register camera stream (HTTP {registration_status}){detail}")
+    async with _http.post(
+        _GO2RTC_WEBRTC.format(serial=quote(stream_name)), data=offer,
+        headers={"Content-Type": "application/sdp"},
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as response:
+        if response.status >= 400:
+            detail = (await response.text())[:300]
+            raise RuntimeError(f"go2rtc WebRTC exchange returned {response.status}: {detail}")
+        return await response.read(), response.headers.get("Location")
+
+
+async def set_live_exposure(serial: str, enabled: bool, config: dict, state: dict) -> None:
+    """Publish/remove the HA live camera and its on-demand RTSP source."""
+    if _http is None:
+        raise RuntimeError("Camera bridge is not running")
+    import ha_mqtt
+    stream_name = f"plaf203_{serial}"
+    if enabled:
+        if serial not in _registered_uids:
+            raise RuntimeError("Feeder camera is not online or enabled")
+        if serial in _live_exposed:
+            return
+        raw_source = _RTSP_URL.format(serial=serial)
+        sources = [raw_source]
+        if __import__("storage").get_settings().get("camera_vp8_transcoding", False):
+            sources.append(f"exec:ffmpeg -flags low_delay -timeout {{timeout}} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -analyzeduration 1000000 -probesize 1000000 -i {raw_source} -r 15 -fps_mode cfr -c:v libvpx -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 15 -keyint_min 15 -b:v 1200k -pix_fmt yuv420p -an -user_agent ffmpeg/go2rtc -rtsp_transport tcp -f rtsp {{output}}")
+        sources.append(f"ffmpeg:{stream_name}#audio=opus")
+        params = [("name", stream_name)]
+        params.extend(("src", source) for source in sources)
+        async with _http.put(
+            f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
+        ) as response:
+            registration_status = response.status
+            registration_detail = (await response.text())[:300] if registration_status >= 400 else ""
+        # go2rtc can add a stream to its in-memory registry and then return
+        # HTTP 400 when persisting the dynamic config fails. Match the WebRTC
+        # path above: verify the live registry before treating that response
+        # as a failed registration.
+        async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
+            if response.status != 200:
+                raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
+            streams = await response.json()
+        if not isinstance(streams, dict) or stream_name not in streams:
+            detail = f": {registration_detail}" if registration_detail else ""
+            raise RuntimeError(
+                f"Could not expose camera stream (HTTP {registration_status}){detail}"
+            )
+        try:
+            await ha_mqtt.publish_live_camera_discovery(
+                serial, config, state, f"rtsp://{_HA_RTSP_HOST}:{_HA_RTSP_PORT}/{stream_name}"
+            )
+        except Exception:
+            async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(stream_name)}"):
+                pass
+            raise
+        _live_exposed.add(serial)
+        return
+
+    await ha_mqtt.remove_live_camera_discovery(serial)
+    _live_exposed.discard(serial)
+    async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(stream_name)}") as response:
+        if response.status >= 400:
+            _LOGGER.warning("Could not remove go2rtc stream for %s... (HTTP %d)", serial[:6], response.status)
+
+
+async def close_webrtc(session_id: str) -> None:
+    location = _webrtc_sessions.pop(session_id, None)
+    if location and _http and not _http.closed:
+        try:
+            target = location if location.startswith("http") else f"{_GO2RTC_API}{location}"
+            async with _http.delete(target):
+                pass
+        except aiohttp.ClientError:
+            pass
+
+
 async def stop_bridge() -> None:
     """Stop snapshot tasks and the bridge during add-on shutdown."""
-    global _http, _bridge_process
+    global _http, _bridge_process, _go2rtc_process
+    import camera_talk
+    await camera_talk.stop_all()
     for serial in list(_tasks):
         await stop_device(serial)
     _registered_uids.clear()
@@ -75,13 +345,23 @@ async def stop_bridge() -> None:
             _bridge_process.kill()
             await _bridge_process.wait()
     _bridge_process = None
+    await _stop_rtsp_loopback()
+    if _go2rtc_process and _go2rtc_process.returncode is None:
+        _go2rtc_process.terminate()
+        try:
+            await asyncio.wait_for(_go2rtc_process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            _go2rtc_process.kill()
+            await _go2rtc_process.wait()
+    _go2rtc_process = None
+    _live_exposed.clear()
     if _http and not _http.closed:
         await _http.close()
     _http = None
 
 
 async def update_device(serial: str, uid: str, enabled: bool) -> None:
-    """Register a camera UID and start or stop its on-demand snapshot loop."""
+    """Register a camera UID without opening a background RTSP session."""
     if not _SERIAL_RE.fullmatch(serial) or not _UID_RE.fullmatch(uid):
         _LOGGER.warning("Ignoring invalid PLAF203 camera identity for %s...", serial[:6])
         return
@@ -105,19 +385,75 @@ async def update_device(serial: str, uid: str, enabled: bool) -> None:
             _LOGGER.exception("Could not register camera UID for %s...", serial[:6])
             return
 
-    task = _tasks.get(serial)
-    if task is None or task.done():
-        _LOGGER.info("Starting HA camera snapshots for %s...", serial[:6])
-        _tasks[serial] = asyncio.create_task(_snapshot_loop(serial), name=f"camera-{serial}")
+    import storage
+    cfg = storage.get_devices().get(serial, {})
+    if cfg.get("live_camera_exposed") and serial not in _live_exposed:
+        try:
+            import devices
+            await set_live_exposure(serial, True, cfg, devices.get_device_state(serial))
+        except Exception:
+            _LOGGER.exception("Could not restore HA live camera exposure for %s...", serial[:6])
+
+    # Do not start an FFmpeg snapshot process merely because the feeder has
+    # its camera enabled.  PLAF203 can stop accepting MQTT control commands
+    # while repeated RTSP login/reconnect attempts are active.  Snapshot/live
+    # consumers must create their own session on demand.
+
+
+async def set_snapshot_interval(seconds: int) -> None:
+    """Apply a new snapshot cadence and restart active FFmpeg capture loops."""
+    global _SNAPSHOT_INTERVAL_SECS
+    import storage
+
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not storage.CAMERA_SNAPSHOT_INTERVAL_MIN_SECONDS <= seconds
+        <= storage.CAMERA_SNAPSHOT_INTERVAL_MAX_SECONDS
+    ):
+        raise ValueError("Camera snapshot interval is outside the supported range")
+    if seconds == _SNAPSHOT_INTERVAL_SECS:
+        return
+
+    active_serials = [serial for serial, task in _tasks.items() if not task.done()]
+    tasks = [_tasks[serial] for serial in active_serials]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    _SNAPSHOT_INTERVAL_SECS = seconds
+    for serial in active_serials:
+        if serial in _registered_uids:
+            _tasks[serial] = asyncio.create_task(
+                _snapshot_loop(serial), name=f"camera-{serial}"
+            )
+    _LOGGER.info("Camera snapshot interval set to %d seconds", seconds)
 
 
 async def stop_device(serial: str) -> None:
+    import camera_talk
+    await camera_talk.stop_device(serial)
+    if _live_serial == serial and _live_process and _live_process.returncode is None:
+        _live_process.kill()
     task = _tasks.pop(serial, None)
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     _registered_uids.pop(serial, None)
     await _set_available(serial, False)
+    try:
+        import ha_mqtt
+        await ha_mqtt.remove_live_camera_discovery(serial)
+    except Exception:
+        _LOGGER.debug("Could not retract live camera discovery for %s...", serial[:6], exc_info=True)
+    _live_exposed.discard(serial)
+    if _http and not _http.closed:
+        try:
+            async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(f'plaf203_{serial}')}"):
+                pass
+        except aiohttp.ClientError:
+            pass
     if _http and not _http.closed:
         try:
             async with _http.delete(f"{_BRIDGE_API}/devices/{serial}"):
@@ -177,11 +513,14 @@ async def _snapshot_loop(serial: str) -> None:
         _tasks.pop(serial, None)
 
 
-async def _drain_stderr(stream) -> None:
+async def _drain_stderr(stream, tail: bytearray | None = None) -> None:
     if stream is None:
         return
-    while await stream.read(4096):
-        pass
+    while chunk := await stream.read(4096):
+        if tail is not None:
+            tail.extend(chunk)
+            if len(tail) > 4096:
+                del tail[:-4096]
 
 
 async def _jpeg_frames(stream):

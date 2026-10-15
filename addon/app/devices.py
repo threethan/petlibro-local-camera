@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 import uuid
 
@@ -27,6 +28,29 @@ _alert_sent:   dict[str, set]   = {}
 _offline_since: dict[str, float] = {}   # epoch when each device first went offline
 _last_seen:    dict[str, float]  = {}   # epoch of most recent MQTT message from device
 _last_attr_poll: dict[str, float] = {}  # epoch of last proactive ATTR_GET_SERVICE query
+_pending_pings: dict[tuple[str, str], asyncio.Future] = {}
+_ping_tasks: dict[str, asyncio.Task] = {}
+_pending_recording_acks: dict[tuple[str, str], asyncio.Future] = {}
+RECORDING_ACK_TIMEOUT_SECS = 5
+_RECORDING_BOOL_FIELDS = frozenset({
+    "videoRecordSwitch", "videoWatermarkSwitch", "feedingVideoSwitch",
+    "enableVideoStartFeedingPlan", "enableVideoAfterManualFeeding",
+})
+_RECORDING_DURATION_FIELDS = frozenset({
+    "beforeFeedingPlanTime", "automaticRecording", "afterManualFeedingTime",
+})
+_RECORDING_TIME_FIELDS = frozenset({
+    "videoRecordStartTime", "videoRecordEndTime",
+    "videoRecordStartTimeUtc", "videoRecordEndTimeUtc",
+})
+_RECORDING_FIELDS = (_RECORDING_BOOL_FIELDS | _RECORDING_DURATION_FIELDS |
+                     _RECORDING_TIME_FIELDS | {"videoRecordMode", "videoRecordAgingType"})
+_SD_CARD_FIELDS = frozenset({"enableVideoRecord", "sdCardState", "sdCardFileSystem",
+                            "sdCardTotalCapacity", "sdCardUsedCapacity"})
+_INDICATOR_TIME_FIELDS = frozenset({"lightingStartTime", "lightingEndTime",
+                                    "lightingStartTimeUtc", "lightingEndTimeUtc"})
+_INDICATOR_FIELDS = _INDICATOR_TIME_FIELDS | {"lightSwitch", "lightAgingType"}
+UI_PING_TIMEOUT_SECS = 5
 
 OFFLINE_ALERT_DELAY_SECS = 90
 WATCHDOG_SECS = 300  # mark offline after 5 min of silence
@@ -364,42 +388,6 @@ def _sync_camera(serial: str) -> None:
     asyncio.create_task(camera.update_device(serial, uid, enabled))
 
 
-async def publish_camera_image(serial: str, image: bytes) -> bool:
-    """Publish one raw JPEG frame for the MQTT camera entity."""
-    if _client_ref is None or not image:
-        return False
-    try:
-        await _client_ref.publish(ha_mqtt.camera_image_topic(serial), image, retain=False)
-        return True
-    except Exception:
-        _LOGGER.debug("Camera image publish failed for %s...", serial[:6], exc_info=True)
-        return False
-
-
-async def publish_camera_availability(serial: str, available: bool) -> None:
-    if _client_ref is None:
-        return
-    await _client_ref.publish(
-        ha_mqtt.camera_availability_topic(serial),
-        "online" if available else "offline",
-        retain=True,
-    )
-
-
-def _sync_camera(serial: str) -> None:
-    if _devices.get(serial, (None, None))[1] != "camera_feeder":
-        return
-    state = _state.get(serial, {})
-    uid = state.get("camera_uid")
-    if not isinstance(uid, str) or not uid:
-        return
-    enabled = bool(state.get("cameraSwitch", state.get("enableCamera", False)))
-    if "enableCamera" in state:
-        enabled = enabled and bool(state["enableCamera"])
-    import camera
-    asyncio.create_task(camera.update_device(serial, uid, enabled))
-
-
 # ── MQTT topic helpers ─────────────────────────────────────────────────────
 
 def _mqtt_model(device_type: str) -> str:
@@ -419,6 +407,44 @@ def _event_sub_topic(device_type: str, serial: str) -> str:
 
 
 # ── Commands ───────────────────────────────────────────────────────────────
+
+async def _ping_device(serial: str) -> None:
+    """Require a fresh device reply, rather than a successful broker publish."""
+    msg_id = uuid.uuid4().hex
+    key = (serial, msg_id)
+    reply = asyncio.get_running_loop().create_future()
+    _pending_pings[key] = reply
+    try:
+        async def exchange():
+            if not await send_command(serial, {"cmd": "ATTR_GET_SERVICE", "msgId": msg_id}):
+                raise RuntimeError("Ping was not sent")
+            await reply
+
+        await asyncio.wait_for(exchange(), timeout=UI_PING_TIMEOUT_SECS)
+    except (asyncio.TimeoutError, RuntimeError):
+        if serial in _devices:
+            _mark_offline(serial)
+            asyncio.ensure_future(_check_and_fire_alerts(serial))
+    finally:
+        _pending_pings.pop(key, None)
+
+
+async def ping_devices() -> None:
+    """Share in-flight probes between visible browser tabs."""
+    tasks = []
+    for serial in list(_devices):
+        task = _ping_tasks.get(serial)
+        if task is None or task.done():
+            task = asyncio.create_task(_ping_device(serial))
+            _ping_tasks[serial] = task
+        tasks.append(task)
+    try:
+        await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+    finally:
+        for serial, task in list(_ping_tasks.items()):
+            if task.done():
+                _ping_tasks.pop(serial, None)
+
 
 async def send_command(serial: str, payload: dict) -> bool:
     global _client_ref
@@ -1036,6 +1062,15 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
 
 async def handle_ha_command(serial: str, cmd: dict) -> None:
     """Public entry-point for API-driven commands (already-parsed dict)."""
+    if _SD_CARD_FIELDS.intersection(cmd):
+        raise ValueError("SD card status and capability fields are read-only")
+    if _RECORDING_FIELDS.intersection(cmd):
+        await _send_camera_settings(serial, cmd)
+        return
+    if (_devices.get(serial, (None, None))[1] == "camera_feeder" and
+            _INDICATOR_FIELDS.intersection(cmd)):
+        await _send_camera_settings(serial, cmd)
+        return
     if cmd.get("_feed_now"):
         ok = await send_manual_feed(serial, 1)
         _LOGGER.info("API Feed Now %s...: %s", serial[:6], "ok" if ok else "failed")
@@ -1160,6 +1195,77 @@ async def handle_ha_command(serial: str, cmd: dict) -> None:
 
 # ── Message handling ───────────────────────────────────────────────────────
 
+async def _send_camera_settings(serial: str, updates: dict) -> None:
+    """Validate recording and indicator settings; save after a matching ACK."""
+    if serial not in _devices or _devices[serial][1] != "camera_feeder":
+        raise ValueError("These settings require a camera feeder")
+    if not _online.get(serial):
+        raise RuntimeError("Camera feeder is offline")
+    if any(key[0] == serial for key in _pending_recording_acks):
+        raise RuntimeError("A camera settings change is already awaiting acknowledgement")
+    if set(updates) - (_RECORDING_FIELDS | _INDICATOR_FIELDS):
+        raise ValueError("Unsupported camera settings")
+    payload = dict(updates)
+    for key, value in payload.items():
+        if key in _RECORDING_BOOL_FIELDS | {"lightSwitch"} and type(value) is not bool:
+            raise ValueError(f"{key} must be a boolean")
+        if key in _RECORDING_DURATION_FIELDS and (type(value) is not int or not 1 <= value <= 5):
+            raise ValueError(f"{key} must be 1 to 5 minutes")
+        if key in _RECORDING_TIME_FIELDS | _INDICATOR_TIME_FIELDS and (not isinstance(value, str) or
+                not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value)):
+            raise ValueError(f"{key} must use HH:MM")
+    if "videoRecordMode" in payload and payload["videoRecordMode"] not in ("CONTINUOUS", "MOTION_DETECTION"):
+        raise ValueError("Unknown recording mode")
+    for aging_key in ("videoRecordAgingType", "lightAgingType"):
+        if aging_key in payload and (type(payload[aging_key]) is not int or payload[aging_key] not in (1, 2)):
+            raise ValueError("Schedule must be all day or custom")
+    state = _state.get(serial, {})
+    for prefix, aging_key, switch_key in (("videoRecord", "videoRecordAgingType", "videoRecordSwitch"),
+                                           ("lighting", "lightAgingType", "lightSwitch")):
+        touched = bool(set(payload) & (_INDICATOR_FIELDS if prefix == "lighting" else
+                                       {key for key in _RECORDING_FIELDS if key.startswith("videoRecord")}))
+        if not touched:
+            continue
+        required = (payload.get(switch_key) is not False and
+                    payload.get(aging_key, state.get(aging_key)) == 2)
+        # Indicator schedules retain their hours when switching back to all day.
+        if not required and prefix != "lighting":
+            continue
+        for key in (prefix + "StartTime", prefix + "EndTime"):
+            value = payload.get(key, None if key + "Utc" in payload else state.get(key))
+            if value is None:
+                utc = payload.get(key + "Utc", state.get(key + "Utc"))
+                if isinstance(utc, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", utc):
+                    uh, um = map(int, utc.split(":"))
+                    zh, zm = map(int, _local_hhmm_to_utc("00:00").split(":"))
+                    minutes = (uh * 60 + um - zh * 60 - zm) % 1440
+                    value = f"{minutes // 60:02d}:{minutes % 60:02d}"
+            if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                if required:
+                    raise ValueError("Custom schedule requires start and end times")
+                continue
+            payload[key] = value
+    for key in ("videoRecordStartTime", "videoRecordEndTime", "lightingStartTime", "lightingEndTime"):
+        if key in payload:
+            payload[key + "Utc"] = _local_hhmm_to_utc(payload[key])
+    if "lightingStartTime" in payload and "lightingEndTime" in payload:
+        payload["lightingTimes"] = _raw_minutes_between(payload["lightingStartTime"], payload["lightingEndTime"])
+    msg_id = uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    ack_key = (serial, msg_id)
+    _pending_recording_acks[ack_key] = future
+    try:
+        if not await send_command(serial, {**payload, "msgId": msg_id}):
+            raise RuntimeError("Camera settings command was not sent")
+        code = await asyncio.wait_for(future, RECORDING_ACK_TIMEOUT_SECS)
+        if type(code) is not int or code != 0:
+            raise RuntimeError("Feeder rejected camera settings")
+        _state.setdefault(serial, {}).update(payload)
+        await _persist_state_cache(serial)
+        await _publish_ha_state(serial)
+    finally:
+        _pending_recording_acks.pop(ack_key, None)
+
 def _handle_message(serial: str, topic_str: str, raw: str):
     try:
         data = json.loads(raw)
@@ -1168,6 +1274,17 @@ def _handle_message(serial: str, topic_str: str, raw: str):
         return
 
     cmd = data.get("cmd")
+    msg_id = data.get("msgId")
+    if cmd == "ATTR_SET_SERVICE" and isinstance(msg_id, str):
+        recording_ack = _pending_recording_acks.get((serial, msg_id))
+        if recording_ack is not None and not recording_ack.done():
+            recording_ack.set_result(data.get("code"))
+            if type(data.get("code")) is not int or data["code"] != 0:
+                return
+    if cmd == "ATTR_GET_SERVICE" and isinstance(msg_id, str):
+        reply = _pending_pings.get((serial, msg_id))
+        if reply is not None and not reply.done():
+            reply.set_result(None)
 
     if cmd == "NTP":
         _LOGGER.info("NTP request from %s...", serial[:6])
@@ -1185,6 +1302,22 @@ def _handle_message(serial: str, topic_str: str, raw: str):
     if cmd == "GET_FEEDING_PLAN_EVENT":
         _ntp_logger.info("FEEDING_PLAN REQUEST from %s... (%s)", serial[:6], _device_name(serial))
         asyncio.ensure_future(_respond_feeding_plan(serial, topic_str))
+        return
+
+    if cmd == "DETECTION_EVENT":
+        # Camera feeder reports a short-lived detection signal with type MOTION
+        # or SOUND. Keep these transient: HA's MQTT event entity ignores retained
+        # deliveries, and each event remains individually automatable.
+        detection_type = data.get("type")
+        device_type = _devices.get(serial, (None, None))[1]
+        if _client_ref is not None and device_type == "camera_feeder" and isinstance(detection_type, str):
+            normalized_type = detection_type.strip().lower()
+            if normalized_type in ("motion", "sound"):
+                asyncio.ensure_future(ha_mqtt.publish_detection_event(
+                    _client_ref, serial, normalized_type, data,
+                ))
+        _mark_online(serial)
+        asyncio.ensure_future(_check_and_fire_alerts(serial))
         return
 
     if cmd == "FEEDING_PLAN_SERVICE":
@@ -2463,7 +2596,11 @@ async def _mqtt_loop():
                     await ha_mqtt.publish_discovery(client, serial, cfg, state, extra_icon_names=custom_icon_names)
                     await ha_mqtt.retract_legacy_entities(client, serial, cfg)
                     await ha_mqtt.publish_state(client, serial, cfg, state, plans=plans)
-                    await ha_mqtt.publish_availability(client, serial, True)
+                    # A broker connection only proves that the add-on is
+                    # connected. Wait for device telemetry before advertising
+                    # this feeder as online; _mark_online publishes "online"
+                    # as soon as the feeder responds.
+                    await ha_mqtt.publish_availability(client, serial, False)
 
                 async for message in client.messages:
                     if _reconnect_event and _reconnect_event.is_set():

@@ -44,7 +44,7 @@ async function toggleLightScheduleEnabled(device) {
 }
 
 async function deleteDevice(serial) {
-  if (!confirm(t("device_modal.delete_confirm"))) return;
+  if (!confirm(t("device_modal.delete_confirm"))) return false;
   const device = _devices.find(d => d.serial === serial);
   let removeCreds = false;
   if (device?.mqtt_user) {
@@ -52,6 +52,9 @@ async function deleteDevice(serial) {
   }
   const url = removeCreds ? `/api/devices/${serial}?remove_creds=1` : `/api/devices/${serial}`;
   await api("DELETE", url);
+  stopLiveCamera();
   document.getElementById("modal-device").classList.remove("open");
+  document.getElementById("modal-edit-device").classList.remove("open");
   await refresh();
+  return true;
 }

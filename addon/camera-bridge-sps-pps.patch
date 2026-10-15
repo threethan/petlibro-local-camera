@@ -1,0 +1,354 @@
+diff --git a/camera-bridge/internal/bridge/media.go b/camera-bridge/internal/bridge/media.go
+--- a/camera-bridge/internal/bridge/media.go
++++ b/camera-bridge/internal/bridge/media.go
+@@ -13,6 +13,7 @@
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/aac"
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264"
+ 	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+ 	"github.com/AlexxIT/go2rtc/pkg/rtsp"
+ 	"github.com/aerodomigue/petlibro-camera-bridge/internal/plaf203"
+@@ -137,6 +138,8 @@
+ 	audioCodec  *core.Codec
+ 	startedAt   time.Time
+ 	latestFrame *plaf203.VideoFrame
++	sps         []byte
++	pps         []byte
+ 	mu          sync.Mutex
+ }
+ 
+@@ -154,6 +157,7 @@ func newMediaPublisher() *mediaPublisher {
+ 	if audioCodec == nil {
+ 		panic("confirmed PLAF203 AAC ADTS header is invalid")
+ 	}
++	audioCodec.PayloadType = core.PayloadTypeRAW
+ 	audioMedia := &core.Media{
+ 		Kind:      core.KindAudio,
+ 		Direction: core.DirectionRecvonly,
+@@ -175,16 +178,19 @@
+ 	if publisher == nil || frame == nil || len(frame.Data) == 0 {
+ 		return
+ 	}
+-	avcc := annexb.EncodeToAVCC(frame.Data)
++	data := publisher.withParameterSets(frame.Data, frame.Keyframe)
++	avcc := annexb.EncodeToAVCC(data)
+ 	if len(avcc) == 0 {
+ 		return
+ 	}
+ 	publisher.mu.Lock()
+ 	if frame.Keyframe {
+-		publisher.latestFrame = cloneFrame(frame)
++		keyframe := cloneFrame(frame)
++		keyframe.Data = append([]byte(nil), data...)
++		publisher.latestFrame = keyframe
+ 	}
+ 	timestamp := uint32(time.Since(publisher.startedAt) * mediaClockRate / mediaTimestampDivisor)
+-	publisher.mu.Unlock()
++	defer publisher.mu.Unlock()
+ 	publisher.videoTrack.WriteRTP(&rtp.Packet{
+ 		// Version zero marks AVCC for go2rtc's internal H264 packetizer. It
+ 		// converts this payload into standards-compliant RTP before WebRTC.
+@@ -193,6 +199,70 @@
+ 	})
+ }
+ 
++// withParameterSets remembers SPS/PPS even when the camera sends them in
++// separate access units, then makes every IDR independently decodable. New
++// RTSP consumers wait for a fresh IDR before receiving dependent frames.
++func (publisher *mediaPublisher) withParameterSets(data []byte, prepend bool) []byte {
++	publisher.mu.Lock()
++	defer publisher.mu.Unlock()
++	var sps, pps []byte
++	for offset := 0; offset < len(data); {
++		start, prefix := annexBStart(data, offset)
++		if start < 0 {
++			break
++		}
++		nalStart := start + prefix
++		next, _ := annexBStart(data, nalStart)
++		nalEnd := len(data)
++		if next >= 0 {
++			nalEnd = next
++		}
++		for nalEnd > nalStart && data[nalEnd-1] == 0 {
++			nalEnd--
++		}
++		if nalStart < nalEnd {
++			switch data[nalStart] & 0x1f {
++			case 7:
++				sps = append([]byte(nil), data[start:nalEnd]...)
++			case 8:
++				pps = append([]byte(nil), data[start:nalEnd]...)
++			}
++		}
++		if next < 0 {
++			break
++		}
++		offset = next
++	}
++	if len(sps) > 0 {
++		publisher.sps = sps
++	}
++	if len(pps) > 0 {
++		publisher.pps = pps
++	}
++	if !prepend || len(publisher.sps) == 0 || len(publisher.pps) == 0 || len(sps) > 0 && len(pps) > 0 {
++		return data
++	}
++	result := make([]byte, 0, len(publisher.sps)+len(publisher.pps)+len(data))
++	result = append(result, publisher.sps...)
++	result = append(result, publisher.pps...)
++	return append(result, data...)
++}
++
++func annexBStart(data []byte, from int) (int, int) {
++	for i := from; i+2 < len(data); i++ {
++		if data[i] != 0 || data[i+1] != 0 {
++			continue
++		}
++		if i+3 < len(data) && data[i+2] == 0 && data[i+3] == 1 {
++			return i, 4
++		}
++		if data[i+2] == 1 {
++			return i, 3
++		}
++	}
++	return -1, 0
++}
++
+ func (publisher *mediaPublisher) publishAudio(frame *plaf203.AudioFrame) {
+ 	if publisher == nil || frame == nil || len(frame.Data) <= aac.ADTSHeaderSize {
+ 		return
+@@ -209,19 +279,37 @@
+ 	if publisher == nil || consumer == nil {
+ 		return errors.New("camera media consumer is unavailable")
+ 	}
+-	if err := consumer.AddTrack(publisher.videoMedia, publisher.videoCodec, publisher.videoTrack); err != nil {
++	publisher.mu.Lock()
++	defer publisher.mu.Unlock()
++	track := publisher.newConsumerVideoTrack()
++	if err := consumer.AddTrack(publisher.videoMedia, publisher.videoCodec, track); err != nil {
+ 		return err
+ 	}
+ 	if err := consumer.AddTrack(publisher.audioMedia, publisher.audioCodec, publisher.audioTrack); err != nil {
+ 		return err
+ 	}
+-	publisher.mu.Lock()
+-	frame := cloneFrame(publisher.latestFrame)
+-	publisher.mu.Unlock()
+-	if frame != nil {
+-		publisher.publish(frame)
+-	}
++	// Subscribe only after the sender is ready, so it cannot miss the first IDR.
++	track.Node.WithParent(&publisher.videoTrack.Node)
+ 	return nil
++}
++
++// Each consumer must start on a fresh IDR. Replaying only a cached IDR and then
++// current P-frames omits their reference frames. Republishing that IDR through
++// the shared track also corrupts consumers that were already decoding live.
++func (publisher *mediaPublisher) newConsumerVideoTrack() *core.Receiver {
++	track := core.NewReceiver(publisher.videoMedia, publisher.videoCodec)
++	input := track.Input
++	started := false
++	track.Input = func(packet *rtp.Packet) {
++		if !started {
++			if !h264.IsKeyframe(packet.Payload) {
++				return
++			}
++			started = true
++		}
++		input(packet)
++	}
++	return track
+ }
+ 
+ func cloneFrame(frame *plaf203.VideoFrame) *plaf203.VideoFrame {
+diff --git a/camera-bridge/internal/bridge/media_test.go b/camera-bridge/internal/bridge/media_test.go
+--- a/camera-bridge/internal/bridge/media_test.go
++++ b/camera-bridge/internal/bridge/media_test.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"bufio"
++	"bytes"
+ 	"net"
+ 	"testing"
+ 	"time"
+@@ -12,6 +13,58 @@
+ 	"github.com/aerodomigue/petlibro-camera-bridge/internal/plaf203"
+ 	"github.com/pion/rtp"
+ )
++
++func TestNewVideoConsumerWaitsForFreshIDRWithoutInterruptingExistingConsumer(t *testing.T) {
++	publisher := newMediaPublisher()
++	var existing, joining []*rtp.Packet
++	first := publisher.newConsumerVideoTrack()
++	first.AppendChild(&core.Node{Input: func(packet *rtp.Packet) { existing = append(existing, packet) }})
++	first.Node.WithParent(&publisher.videoTrack.Node)
++	idr := &plaf203.VideoFrame{Codec: "h264", Keyframe: true, Data: []byte{0, 0, 0, 1, 0x65, 0x88}}
++	pframe := &plaf203.VideoFrame{Codec: "h264", Data: []byte{0, 0, 0, 1, 0x41, 0x99}}
++	publisher.publish(pframe)
++	if len(existing) != 0 {
++		t.Fatal("consumer received dependent frames before an IDR")
++	}
++	publisher.publish(idr)
++	publisher.publish(pframe)
++	second := publisher.newConsumerVideoTrack()
++	second.AppendChild(&core.Node{Input: func(packet *rtp.Packet) { joining = append(joining, packet) }})
++	second.Node.WithParent(&publisher.videoTrack.Node)
++	if len(existing) != 2 || len(joining) != 0 {
++		t.Fatal("joining consumer caused stale keyframe replay")
++	}
++	publisher.publish(pframe)
++	if len(existing) != 3 || len(joining) != 0 {
++		t.Fatal("join interrupted existing consumer or forwarded undecodable P-frame")
++	}
++	publisher.publish(idr)
++	publisher.publish(pframe)
++	if len(existing) != 5 || len(joining) != 2 {
++		t.Fatalf("existing=%d joining=%d", len(existing), len(joining))
++	}
++	if !bytes.Equal(joining[0].Payload, existing[3].Payload) || !bytes.Equal(joining[1].Payload, existing[4].Payload) {
++		t.Fatal("joining consumer did not receive the fresh IDR followed by live frames")
++	}
++}
++
++func TestFreshIDRIncludesCachedParameterSets(t *testing.T) {
++	publisher := newMediaPublisher()
++	sps := []byte{0, 0, 0, 1, 0x67, 0x42}
++	pps := []byte{0, 0, 0, 1, 0x68, 0xCE}
++	publisher.publish(&plaf203.VideoFrame{Data: sps})
++	publisher.publish(&plaf203.VideoFrame{Data: pps})
++	track := publisher.newConsumerVideoTrack()
++	var packets []*rtp.Packet
++	track.AppendChild(&core.Node{Input: func(packet *rtp.Packet) { packets = append(packets, packet) }})
++	track.Node.WithParent(&publisher.videoTrack.Node)
++	publisher.publish(&plaf203.VideoFrame{Keyframe: true, Data: []byte{0, 0, 0, 1, 0x65, 0x88}})
++	if len(packets) != 1 || !bytes.Equal(packets[0].Payload, []byte{
++		0, 0, 0, 2, 0x67, 0x42, 0, 0, 0, 2, 0x68, 0xCE, 0, 0, 0, 2, 0x65, 0x88,
++	}) {
++		t.Fatalf("fresh IDR did not include SPS/PPS: %v", packets)
++	}
++}
+ 
+ func TestDeviceIDFromMediaPathOnlyAcceptsOneDeviceScopedRTSPPath(t *testing.T) {
+ 	deviceID, ok := deviceIDFromMediaPath("/device/AF03040302A2B5B2CD60")
+diff --git a/camera-bridge/internal/bridge/registry.go b/camera-bridge/internal/bridge/registry.go
+--- a/camera-bridge/internal/bridge/registry.go
++++ b/camera-bridge/internal/bridge/registry.go
+@@ -490,6 +490,12 @@ func (r *Registry) transition(deviceID string, attemptID uint64, event plaf203.E
+ 		if event.Step == "audio_start_tx" {
+ 			log.Printf("CAMERA AUDIO START TX device=%s channel=0x%04x control_type=0x%04x", deviceID, 0x7000, event.ControlType)
+ 		}
++		if event.Step == "audio_start_retry_tx" {
++			log.Printf("CAMERA AUDIO START RETRY TX device=%s channel=0x%04x control_type=0x%04x", deviceID, 0x7000, event.ControlType)
++		}
++		if event.Step == "audio_start_retry_failed" {
++			log.Printf("CAMERA AUDIO START RETRY FAILED device=%s error=%s", deviceID, event.Error)
++		}
+ 		if event.Step == "audio_stop_tx" {
+ 			log.Printf("CAMERA AUDIO STOP TX device=%s channel=0x%04x control_type=0x%04x", deviceID, 0x7000, event.ControlType)
+ 		}
+diff --git a/camera-bridge/internal/plaf203/bootstrap.go b/camera-bridge/internal/plaf203/bootstrap.go
+--- a/camera-bridge/internal/plaf203/bootstrap.go
++++ b/camera-bridge/internal/plaf203/bootstrap.go
+@@ -154,6 +154,23 @@ func (session *Session) sendControl(channel uint16, index uint32, controlType ui
+ 	return nil
+ }
+ 
++// sendRuntimeControl advances the IOCtrl index established by the three
++// bootstrap commands. Reusing index zero makes the feeder discard AUDIOSTART
++// as a duplicate of SET_STREAM_CTRL even though the command counter changes.
++func (session *Session) sendRuntimeControl(controlType uint32) error {
++	payload := make([]byte, 4+audioControlArgumentSize)
++	binary.LittleEndian.PutUint32(payload, controlType)
++	session.sendMu.Lock()
++	defer session.sendMu.Unlock()
++	index := session.controlIndex
++	session.controlIndex++
++	body := encodeControlData(session.session25.nextOutboundCommand(), controlChannelSystem, index, payload)
++	if err := session.sendBodyLocked(body); err != nil {
++		return fmt.Errorf("send PLAF203 runtime control type=0x%04x index=%d: %w", controlType, index, err)
++	}
++	return nil
++}
++
+ func (session *Session) waitForControlReplies(ctx context.Context, diagnostics *bootstrapDiagnostics) error {
+ 	replyContext, cancel := context.WithTimeout(ctx, bootstrapReplyTimeout)
+ 	defer cancel()
+diff --git a/camera-bridge/internal/plaf203/login.go b/camera-bridge/internal/plaf203/login.go
+--- a/camera-bridge/internal/plaf203/login.go
++++ b/camera-bridge/internal/plaf203/login.go
+@@ -77,6 +77,7 @@ type Session struct {
+ 	transport             DatagramTransport
+ 	clock                 func() time.Time
+ 	sequence              uint16
++	controlIndex          uint32
+ 	session25             session25State
+ 	media                 *MediaReceiver
+ 	observer              Observer
+@@ -138,14 +139,33 @@ func (session *Session) StartAudio() error {
+ 	if session.transport == nil || session.Address == nil {
+ 		return errors.New("PLAF203 audio transport is unavailable")
+ 	}
+-	if err := session.sendControl(controlChannelSystem, 0, controlStartAudio, make([]byte, audioControlArgumentSize)); err != nil {
++	if err := session.sendRuntimeControl(controlStartAudio); err != nil {
+ 		return fmt.Errorf("send PLAF203 AUDIOSTART: %w", err)
+ 	}
+ 	session.audioEnabled = true
+ 	emit(session.observer, Event{State: StateStreaming, Address: cloneUDPAddress(session.Address), Step: "audio_start_tx", ControlType: controlStartAudio})
++	for _, delay := range []time.Duration{time.Second, 3 * time.Second, 5 * time.Second} {
++		time.AfterFunc(delay, session.retryAudioStart)
++	}
+ 	return nil
+ }
+ 
++func (session *Session) retryAudioStart() {
++	if session.MediaStats().AudioFramesReceived > 0 {
++		return
++	}
++	session.audioMu.Lock()
++	defer session.audioMu.Unlock()
++	if !session.audioEnabled || session.transport == nil || session.Address == nil {
++		return
++	}
++	if err := session.sendRuntimeControl(controlStartAudio); err != nil {
++		emit(session.observer, Event{State: StateStreaming, Address: cloneUDPAddress(session.Address), Step: "audio_start_retry_failed", Error: err.Error()})
++		return
++	}
++	emit(session.observer, Event{State: StateStreaming, Address: cloneUDPAddress(session.Address), Step: "audio_start_retry_tx", ControlType: controlStartAudio})
++}
++
+ // StopAudio disables the confirmed PLAF203 AAC media channel. It is idempotent
+ // and is called when the final local media consumer leaves or the session closes.
+ func (session *Session) StopAudio() error {
+@@ -161,7 +181,7 @@ func (session *Session) StopAudio() error {
+ 		session.audioEnabled = false
+ 		return nil
+ 	}
+-	if err := session.sendControl(controlChannelSystem, 0, controlStopAudio, make([]byte, audioControlArgumentSize)); err != nil {
++	if err := session.sendRuntimeControl(controlStopAudio); err != nil {
+ 		return fmt.Errorf("send PLAF203 AUDIOSTOP: %w", err)
+ 	}
+ 	session.audioEnabled = false
+diff --git a/camera-bridge/internal/plaf203/session.go b/camera-bridge/internal/plaf203/session.go
+--- a/camera-bridge/internal/plaf203/session.go
++++ b/camera-bridge/internal/plaf203/session.go
+@@ -202,10 +202,11 @@ func (connector *DirectConnector) connectWithTransport(ctx context.Context, uid
+ 			Address:   cloneUDPAddress(address),
+ 			transport: transport,
+ 			clock:     clock,
+-			sequence:  2,
+-			session25: newSession25State(),
+-			media:     NewMediaReceiver(),
+-			observer:  observe,
++			sequence:     2,
++			controlIndex: 3,
++			session25:    newSession25State(),
++			media:        NewMediaReceiver(),
++			observer:     observe,
+ 		}
+ 		emit(observe, Event{State: StateConnected, Address: address})
+ 		emit(observe, Event{State: StateBootstrapping, Address: address})

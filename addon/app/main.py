@@ -6,11 +6,14 @@ import json
 import logging
 import os
 import re
+import secrets
+import socket
 import uuid
 
 from aiohttp import web
 
 import camera
+import camera_talk
 import devices
 import ha_api
 import mosquitto
@@ -21,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 _LOGGER = logging.getLogger(__name__)
 
-VERSION = "2026.10.1"
+VERSION = "2026.10.7"
 
 # Credential capture state
 _capture_state: dict = {"status": "idle", "result": {}}
@@ -215,10 +218,13 @@ async def handle_api_device_push_audio(request):
     try:
         data = await request.json()
         name = (data.get("name") or "").strip().lower()
+        sound_repititions = int(data.get("soundRepititions", 1))
     except Exception:
         return web.Response(status=400, text="Bad request")
     if not name or not _AUDIO_NAME_RE.match(name):
         return web.Response(status=400, text="name required")
+    if not 1 <= sound_repititions <= 5:
+        return web.Response(status=400, text="soundRepititions must be between 1 and 5")
 
     base_url = storage.get_settings().get("local_audio_base_url", "").strip()
     if not base_url:
@@ -227,7 +233,12 @@ async def handle_api_device_push_audio(request):
         return web.Response(status=404, text="Sound not found")
 
     audio_url = f"{base_url.rstrip('/')}/audio/{name}.aac"
-    ok = await devices.send_command(serial, {"audioUrl": audio_url, "enableAudio": True})
+    ok = await devices.send_command(serial, {
+        "audioUrl": audio_url,
+        "enableAudio": True,
+        # The feeder protocol misspells this field; retain its exact spelling.
+        "soundRepititions": sound_repititions,
+    })
     if not ok:
         return web.Response(status=400, text="Failed to send command")
     return web.json_response({"status": "ok", "audio_url": audio_url})
@@ -246,6 +257,98 @@ async def handle_locales_available(request):
 
 async def handle_api_devices_get(request):
     return web.json_response(_devices_with_state())
+
+
+async def handle_api_devices_ping(request):
+    await devices.ping_devices()
+    return web.json_response(_devices_with_state())
+
+
+async def handle_api_camera_live(request):
+    """Proxy one explicitly requested low-rate camera stream to the UI."""
+    serial = request.match_info["serial"]
+    if not camera.live_stream_available(serial):
+        return web.Response(status=409, text="Camera is unavailable or another live view is active")
+    frames = camera.live_frames(serial)
+    try:
+        first_frame = await asyncio.wait_for(anext(frames), timeout=10)
+    except Exception as error:
+        await frames.aclose()
+        _LOGGER.warning("Live camera startup failed for %s...: %s", serial[:6], error, exc_info=True)
+        return web.Response(status=503, text="Camera stream could not start")
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "multipart/x-mixed-replace; boundary=petlibroframe",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await response.prepare(request)
+    try:
+        for frame in (first_frame,):
+            await response.write(
+                b"--petlibroframe\r\nContent-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(frame)}\r\n\r\n".encode()
+                + frame
+                + b"\r\n"
+            )
+        async for frame in frames:
+            await response.write(
+                b"--petlibroframe\r\nContent-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(frame)}\r\n\r\n".encode()
+                + frame
+                + b"\r\n"
+            )
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    except Exception:
+        _LOGGER.exception("Live camera stream failed for %s...", serial[:6])
+    finally:
+        await frames.aclose()
+        try:
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+    return response
+
+
+async def handle_api_camera_webrtc(request):
+    serial = request.match_info["serial"]
+    offer = await request.read()
+    if not offer or len(offer) > 128 * 1024:
+        return web.Response(status=400, text="Invalid WebRTC offer")
+    try:
+        answer, location = await camera.exchange_webrtc(serial, offer)
+    except Exception as error:
+        _LOGGER.warning("WebRTC camera startup failed for %s...: %s", serial[:6], error)
+        return web.Response(status=503, text=f"Camera stream is unavailable: {error}")
+    import secrets
+    session_id = secrets.token_urlsafe(18)
+    if location:
+        camera._webrtc_sessions[session_id] = location
+    return web.Response(status=201, body=answer, content_type="application/sdp", headers={"X-Petlibro-WebRTC-Session": session_id})
+
+
+async def handle_api_camera_webrtc_close(request):
+    await camera.close_webrtc(request.match_info["session_id"])
+    return web.Response(status=204)
+
+
+async def handle_api_camera_live_exposure(request):
+    serial = request.match_info["serial"]
+    try:
+        data = await request.json()
+        enabled = data.get("enabled") is True
+        cfg = storage.get_devices().get(serial)
+        if not cfg or cfg.get("device_type") != "camera_feeder":
+            return web.json_response({"error": "Camera feeder not found"}, status=404)
+        await camera.set_live_exposure(serial, enabled, cfg, devices.get_device_state(serial))
+        storage.save_device(serial, {"live_camera_exposed": enabled})
+        return web.json_response({"enabled": enabled})
+    except Exception as error:
+        return web.json_response({"error": str(error)}, status=503)
 
 
 async def handle_api_device_post(request):
@@ -529,11 +632,39 @@ async def handle_api_settings_get(request):
     return web.json_response(storage.get_settings())
 
 
+async def handle_api_local_audio_url_suggestion(request):
+    """Suggest the add-on's LAN URL using the host's default IPv4 route.
+
+    The add-on runs with host networking, so this is the source address the
+    host would use to reach another LAN. UDP connect only selects a route; it
+    does not send a packet.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))
+        host = sock.getsockname()[0]
+    except OSError:
+        host = ""
+    finally:
+        sock.close()
+
+    try:
+        address = ipaddress.ip_address(host)
+        if address.version != 4 or address.is_loopback or address.is_link_local or address.is_unspecified:
+            raise ValueError("No usable LAN address")
+    except ValueError:
+        return web.Response(status=503, text="Could not determine the Home Assistant LAN address")
+
+    port = int(os.environ.get("INGRESS_PORT", 8765))
+    return web.json_response({"url": f"http://{address}:{port}"})
+
+
 async def handle_api_settings_post(request):
     try:
         data = await request.json()
         result = storage.save_settings(data)
         settings = storage.get_settings()
+        await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
         devices.configure(
             settings["mqtt_host"],
             settings["mqtt_port"],
@@ -555,6 +686,50 @@ async def handle_api_settings_post(request):
     except Exception:
         _LOGGER.exception("Failed to save settings")
         return web.Response(status=400, text="Bad request")
+
+
+async def handle_api_settings_mqtt_auto_add(request):
+    """Create the dedicated Petlibro Local login in the running Mosquitto add-on."""
+    from ha_config import SUPERVISOR_TOKEN
+
+    if not SUPERVISOR_TOKEN:
+        return web.json_response({"status": "error", "detail": "Supervisor access is unavailable."})
+
+    info = await mosquitto.get_addon_info()
+    addon = info.get("data") if isinstance(info, dict) else None
+    if not addon:
+        return web.json_response({"status": "not_installed"})
+    if addon.get("state") != "started":
+        return web.json_response({"status": "not_started"})
+
+    username = "petlibro-local"
+    password = secrets.token_urlsafe(24)
+    removed = await mosquitto.remove_mosquitto_logins_matching("petlibro local")
+    if removed == "error":
+        return web.json_response({"status": "error", "detail": "Could not remove the existing Petlibro Local Mosquitto login(s). Check Supervisor access and the add-on logs."})
+    result = await mosquitto.add_mosquitto_login(username, password)
+    if result not in ("added", "exists"):
+        return web.json_response({"status": "error", "detail": "Could not save the Mosquitto login. Check Supervisor access and the add-on logs."})
+
+    # Mosquitto reads login changes on restart. Match the existing credential
+    # management flow and briefly suppress offline alerts during reconnect.
+    devices.suppress_alerts(True)
+    stopped = await mosquitto.stop_mosquitto()
+    if not stopped:
+        devices.suppress_alerts(False)
+        return web.json_response({"status": "error", "detail": "The login was saved, but Mosquitto could not be stopped to apply it."})
+    await asyncio.sleep(2)
+    started = await mosquitto.start_mosquitto()
+    if not started:
+        devices.suppress_alerts(False)
+        _LOGGER.error("Mosquitto login saved but broker restart failed")
+        return web.json_response({"status": "error", "detail": "The login was saved, but Mosquitto did not restart. Start the Mosquitto add-on in Home Assistant."})
+
+    async def _lift_alert_suppression():
+        await asyncio.sleep(30)
+        devices.suppress_alerts(False)
+    asyncio.ensure_future(_lift_alert_suppression())
+    return web.json_response({"status": "ok", "username": username, "password": password})
 
 
 async def handle_api_capture_start(request):
@@ -921,6 +1096,7 @@ async def on_startup(app):
     if not bridge_ready:
         _LOGGER.warning("PLAF203 camera support is unavailable until the bridge starts")
     settings = storage.get_settings()
+    await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
     devices.configure(
         settings["mqtt_host"],
         settings["mqtt_port"],
@@ -990,6 +1166,7 @@ async def _restrict_api_middleware(request, handler):
 def main():
     app = web.Application(middlewares=[_restrict_api_middleware])
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(camera_talk.on_shutdown)
     app.on_cleanup.append(on_cleanup)
 
     app.router.add_get("/",                              handle_index)
@@ -1001,6 +1178,12 @@ def main():
     app.router.add_get(r"/{name:[^/]+\.(js|css)}",       handle_static)
 
     app.router.add_get("/api/devices",                   handle_api_devices_get)
+    app.router.add_post("/api/devices/ping",             handle_api_devices_ping)
+    app.router.add_get("/api/devices/{serial}/camera/live", handle_api_camera_live)
+    app.router.add_get("/api/devices/{serial}/camera/talk", camera_talk.handle_talk)
+    app.router.add_post("/api/devices/{serial}/camera/webrtc", handle_api_camera_webrtc)
+    app.router.add_delete("/api/devices/{serial}/camera/webrtc/{session_id}", handle_api_camera_webrtc_close)
+    app.router.add_post("/api/devices/{serial}/camera/exposure", handle_api_camera_live_exposure)
     app.router.add_post("/api/devices",                  handle_api_device_add)
     app.router.add_post("/api/devices/{serial}",         handle_api_device_post)
     app.router.add_delete("/api/devices/{serial}",        handle_api_device_delete)
@@ -1037,6 +1220,8 @@ def main():
 
     app.router.add_get("/api/settings",                  handle_api_settings_get)
     app.router.add_post("/api/settings",                 handle_api_settings_post)
+    app.router.add_get("/api/settings/local-audio-url-suggestion", handle_api_local_audio_url_suggestion)
+    app.router.add_post("/api/settings/mqtt-auto-add",    handle_api_settings_mqtt_auto_add)
 
     app.router.add_post("/api/capture/start",            handle_api_capture_start)
     app.router.add_get("/api/capture/status",            handle_api_capture_status)

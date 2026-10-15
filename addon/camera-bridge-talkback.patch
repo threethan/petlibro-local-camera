@@ -1,0 +1,98 @@
+diff --git a/camera-bridge/internal/plaf203/login.go b/camera-bridge/internal/plaf203/login.go
+--- a/camera-bridge/internal/plaf203/login.go
++++ b/camera-bridge/internal/plaf203/login.go
+@@ -20,6 +20,7 @@ const (
+ 	loginFieldLength    = 257
+ 
+ 	sessionFlags                     = 0x0A
++	clientSessionFlags                = 0x0B
+-	clientSessionMagicVersion        = 0x1C
++	clientSessionMagicVersion        = 0x1D
+ 	deviceSessionMagicVersion        = 0x1B
+ 	clientSessionOpcode       uint16 = 0x0407
+@@ -102,3 +103,6 @@ type Session struct {
+ 	closeOnce             sync.Once
+ 	closeErr              error
++	talkMu                sync.Mutex
++	talk                  *talkbackState
++	talkClosed            bool
+ }
+@@ -115,5 +118,6 @@ func (session *Session) Close() error {
+ 	}
+ 	session.closeOnce.Do(func() {
++		session.closeTalkback()
+ 		_ = session.StopAudio()
+ 		if session.cancelReceive != nil {
+ 			session.cancelReceive()
+@@ -283,5 +284,5 @@ func (request LoginRequest) Encode() ([]byte, error) {
+ 	packet[0] = 0x04
+ 	packet[1] = 0x02
+ 	packet[2] = clientSessionMagicVersion
+-	packet[3] = sessionFlags
++	packet[3] = clientSessionFlags
+ 	binary.LittleEndian.PutUint16(packet[4:], loginRequestLength-16)
+diff --git a/camera-bridge/internal/plaf203/bootstrap.go b/camera-bridge/internal/plaf203/bootstrap.go
+--- a/camera-bridge/internal/plaf203/bootstrap.go
++++ b/camera-bridge/internal/plaf203/bootstrap.go
+@@ -95,7 +95,7 @@ func (session *Session) sendStartVideo() error {
+ 	binary.LittleEndian.PutUint32(payload, controlStartVideo)
+ 	body := encodeControlData(session.nextSession25ControlCounter(), controlChannelSystem, 2, payload)
+ 	packet := encodeClientSessionPacket(session.ID, session.nextSequence(), body)
+-	wire := tutk.TransCodePartial(nil, packet)
++	wire := tutk.TransCodeBlob(packet)
+ 	emit(session.observer, Event{
+ 		State:          StateBootstrapping,
+ 		Address:        cloneUDPAddress(session.Address),
+@@ -409,3 +409,3 @@
+ func (session *Session) sendPacket(packet []byte) error {
+-	return session.transport.SendTo(tutk.TransCodePartial(nil, packet), session.Address)
++	return session.transport.SendTo(tutk.TransCodeBlob(packet), session.Address)
+ }
+@@ -430,5 +430,5 @@ func encodeClientSessionPacket(sessionID [8]byte, sequence uint16, body []byte) []byte {
+ 	packet[0] = 0x04
+ 	packet[1] = 0x02
+ 	packet[2] = clientSessionMagicVersion
+-	packet[3] = sessionFlags
++	packet[3] = clientSessionFlags
+ 	binary.LittleEndian.PutUint16(packet[4:], uint16(len(packet)-16))
+diff --git a/camera-bridge/internal/plaf203/session.go b/camera-bridge/internal/plaf203/session.go
+--- a/camera-bridge/internal/plaf203/session.go
++++ b/camera-bridge/internal/plaf203/session.go
+@@ -289,5 +289,5 @@
+ 				return
+ 			}
+-			decoded := tutk.ReverseTransCodePartial(nil, packet)
++			decoded := tutk.ReverseTransCodeBlob(packet)
+ 			if handled, keepaliveErr := session.replyKeepalive(decoded, peer); keepaliveErr != nil {
+ 				return
+diff --git a/camera-bridge/internal/plaf203/login_test.go b/camera-bridge/internal/plaf203/login_test.go
+--- a/camera-bridge/internal/plaf203/login_test.go
++++ b/camera-bridge/internal/plaf203/login_test.go
+@@ -73,7 +73,7 @@
+ 	packet, err := request.Encode()
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if len(packet) != loginRequestLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != clientSessionMagicVersion || packet[3] != sessionFlags {
++	if len(packet) != loginRequestLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != clientSessionMagicVersion || packet[3] != clientSessionFlags {
+ 		t.Fatalf("unexpected login header: %x", packet[:4])
+ 	}
+diff --git a/camera-bridge/internal/plaf203/testdata/session25_counters_client_decoded.hex b/camera-bridge/internal/plaf203/testdata/session25_counters_client_decoded.hex
+--- a/camera-bridge/internal/plaf203/testdata/session25_counters_client_decoded.hex
++++ b/camera-bridge/internal/plaf203/testdata/session25_counters_client_decoded.hex
+@@ -1,4 +1,4 @@
+-04021c0a24000f000704210059330000
++04021d0b24000f000704210059330000
+ 0c0000005933608dc8d1d89e09000b00
+ 08000000ff3fff3f0300000000000400
+ e7470000
+diff --git a/camera-bridge/internal/bridge/http.go b/camera-bridge/internal/bridge/http.go
+--- a/camera-bridge/internal/bridge/http.go
++++ b/camera-bridge/internal/bridge/http.go
+@@ -12,5 +12,6 @@ func NewHandler(registry *Registry) http.Handler {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", healthHandler)
++	mux.HandleFunc("POST /devices/{device_id}/talkback", registry.talkbackHandler)
+ 	mux.HandleFunc("GET /devices", func(writer http.ResponseWriter, request *http.Request) {
+ 		writeJSON(writer, http.StatusOK, map[string]any{
+ 			"devices": registry.List(),

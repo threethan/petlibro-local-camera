@@ -1,5 +1,32 @@
 # Features
 
+## Camera feeder SD recording
+
+The camera feeder's **Sensors → Indicator lights** section provides an on/off
+switch and optional daily hours. With Schedule disabled, lights are enabled
+all day; with it enabled, start/end times define the active interval. Hours
+use the configured feeder timezone and may cross midnight. Changes wait for
+the feeder's acknowledgement. The command includes local and UTC hours and
+the vendor's signed `lightingTimes` duration; switching back to all day
+preserves known hours. Physical scheduling still needs target-device testing.
+
+On a PLAF203 camera feeder, open **Sensors → SD card recording** to enable
+continuous or motion-triggered recording and set all-day or custom hours.
+Hours use the configured feeder timezone; overnight intervals are supported.
+Motion recording also requires Motion Detection enabled with overlapping hours.
+The feeder records to its own SD card independently of the live-view player.
+
+The **Feeding video** section controls scheduled and manual feeding clips,
+including durations of 1–5 minutes. The automatic recording duration controls
+a feeding clip, rather than enabling continuous SD recording.
+
+The SD card section displays the last reported status, filesystem, total,
+used and free capacity, and recording capability. Missing facts show Unknown.
+Recording changes are validated and wait up to five seconds for a matching
+successful feeder acknowledgement. An acknowledgement confirms acceptance;
+actual footage, full-card behavior, and reboot persistence need device testing.
+SD playback, downloads and formatting are not provided by these controls.
+
 Back to the [README](../README.md).
 
 - [Fountains](#fountains)
@@ -29,7 +56,7 @@ Back to the [README](../README.md).
 
 ### Smart Camera Feeder (PLAF203)
 
-When the feeder camera is enabled, Petlibro Local registers the camera UID from `DEVICE_START_EVENT` with the bundled direct-LAN bridge. Home Assistant discovers a Camera entity through MQTT and receives a JPEG snapshot roughly every five seconds. The bridge API and RTSP listener bind to loopback only; camera access does not use Petlibro cloud credentials or require internet access. The HA entity is snapshot-based, not a continuous WebRTC stream.
+When the feeder camera is enabled, Petlibro Local registers the camera UID from `DEVICE_START_EVENT` with the bundled direct-LAN bridge. Home Assistant discovers a Camera entity through MQTT and receives JPEG snapshots at the interval set in Settings > Camera (1–300 seconds; default 5). Below the web UI live view, enable **Live Camera in Home Assistant** to register a separate native streaming camera; disabling it removes that entity and its go2rtc stream. The native camera integration must be added to Home Assistant once (Settings > Devices & services > Add integration > Petlibro Local - Live Camera Bridge); the deploy script installs its files. The go2rtc RTSP listener is bound to Home Assistant's Supervisor network interface. Camera access does not use Petlibro cloud credentials or require internet access.
 
 ### Feeder Monitoring
 - Next meal time pulled from the active feeding schedule and shown on the device card, converted to your local timezone
@@ -59,6 +86,7 @@ The Schedule tab lists every meal with its time, days, amount and sound, and let
 
 ### Sound
 
+- **Microphone Talk (camera feeder, Status tab):** browser microphone capture and the streaming relay are implemented. The official-app capture established the V3.0.30 speaker packet flow and the bridge follows it; audible playback on the physical feeder remains unverified. See [talkback validation status](microphone-talkback.md).
 - **Device Sound hours** (One RFID, Overview tab): sounds play all day, or only inside a custom time window, like the Device Sound setting in the Petlibro app. Times are your local time.
 - **Custom feed sounds**: upload an audio file (any common format, MP3/WAV/M4A/etc., converted automatically) or record one from your microphone, in the Settings → Audio tab. All feeders share one sound library there. From a feeder's Maintenance tab, pick a sound and push it to play on that feeder's feeds instead of the default chime. Requires a one-time "Local Audio Base URL" setting (a plain LAN address for this app, since the feeder fetches the file directly and can't use your logged-in browser session). Plays on scheduled feeds and on a manual Feed Now
 

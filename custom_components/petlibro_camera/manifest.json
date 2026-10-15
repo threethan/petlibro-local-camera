@@ -1,0 +1,10 @@
+{
+  "domain": "petlibro_camera",
+  "name": "Petlibro Local - Live Camera Bridge",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["mqtt", "stream"],
+  "documentation": "https://github.com/smcneece/petlibro-local",
+  "iot_class": "local_push",
+  "version": "1.1.0"
+}

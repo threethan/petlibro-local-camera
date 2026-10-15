@@ -3,26 +3,24 @@ function renderPets() {
   const key = JSON.stringify(_pets.map(p => ({ id: p.id, name: p.name, breed: p.breed, w: p.weight_kg, img: p.image_url })));
   if (key === _lastPetRenderKey) return;
   _lastPetRenderKey = key;
-  populateSortSelect();
-
   const list = document.getElementById("pet-list");
   if (!_pets.length) {
     list.innerHTML = `<div class="empty-state">
-      <div class="empty-icon">🐾</div>
+      <div class="empty-icon"><span class="material-icons">pets</span></div>
       <div class="empty-msg">${t("pet.none")}</div>
     </div>`;
     return;
   }
   list.innerHTML = _pets.map(p => `<div class="pet-card" data-pet-id="${escHtml(p.id)}" style="position:relative">
-    <div class="pet-avatar">${p.image_url ? `<img src="${escHtml(p.image_url)}" alt="">` : "🐾"}</div>
+    <div class="pet-avatar">${p.image_url ? `<img src="${escHtml(p.image_url)}" alt="">` : `<span class="material-icons">pets</span>`}</div>
     <div class="pet-info">
       <div class="pet-name">${escHtml(p.name || "Unnamed pet")}</div>
       <div class="pet-sub">${escHtml(p.breed || "")}${p.weight_kg ? ` · ${useImperial() ? (p.weight_kg * 2.20462).toFixed(1) + " lbs" : p.weight_kg + " kg"}` : ""}</div>
     </div>
     <button class="btn-pet-delete-card" data-pet-id="${escHtml(p.id)}" title="Delete pet"
-      style="position:absolute;top:50%;right:10px;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:20px;line-height:1;padding:2px;opacity:0.5"
+      style="position:absolute;top:50%;right:10px;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:20px;line-height:1;padding:2px;color:var(--pl-danger);opacity:0.85"
       onmouseenter="this.style.opacity='1'"
-      onmouseleave="this.style.opacity='0.5'">🗑️</button>
+      onmouseleave="this.style.opacity='0.5'"><span class="material-icons">delete</span></button>
   </div>`).join("");
 
   list.querySelectorAll(".pet-card").forEach(card => {

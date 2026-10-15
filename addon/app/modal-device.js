@@ -1,5 +1,73 @@
 // ── Device detail modal ────────────────────────────────────────────────────
+let _liveCameraPc = null;
+let _liveCameraSession = null;
+let _liveCameraSerial = null;
+let _liveCameraPowerOwner = null;
+let _liveCameraGeneration = 0;
+const _cameraPowerOwners = new Map();
+let _liveCameraPowerRequest = Promise.resolve();
+function preferVP8(transceiver) {
+  const codecs = RTCRtpSender.getCapabilities?.("video")?.codecs;
+  if (!codecs || !transceiver.setCodecPreferences) return;
+  const vp8 = codecs.filter(codec => codec.mimeType.toLowerCase() === "video/vp8");
+  if (vp8.length) {
+    const preferred = new Set(vp8);
+    transceiver.setCodecPreferences([...vp8, ...codecs.filter(codec => !preferred.has(codec))]);
+  }
+}
+function setLiveCameraPower(serial, enabled) {
+  _liveCameraPowerRequest = _liveCameraPowerRequest.catch(() => {}).then(async () => {
+    await api("POST", `/api/devices/${encodeURIComponent(serial)}/command`, { cameraSwitch: enabled });
+    _patchDevice(serial, { cameraSwitch: enabled });
+    if (_currentDevice?.serial === serial) _currentDevice.cameraSwitch = enabled;
+  });
+  return _liveCameraPowerRequest;
+}
+function acquireCameraPower(serial, owner) {
+  let lease = _cameraPowerOwners.get(serial);
+  if (!lease) {
+    lease = { owners: new Set(), ready: setLiveCameraPower(serial, true) };
+    _cameraPowerOwners.set(serial, lease);
+  }
+  lease.owners.add(owner);
+  return lease.ready;
+}
+function releaseCameraPower(serial, owner) {
+  const lease = _cameraPowerOwners.get(serial);
+  if (!lease || !lease.owners.delete(owner) || lease.owners.size) return;
+  _cameraPowerOwners.delete(serial);
+  setLiveCameraPower(serial, false).catch(() => {});
+}
+function stopLiveCamera(stopTalk = true) {
+  if (stopTalk) stopCameraTalk();
+  _liveCameraGeneration++;
+  const powerOwner = _liveCameraPowerOwner;
+  _liveCameraPowerOwner = null;
+  if (_liveCameraPc) { _liveCameraPc.close(); _liveCameraPc = null; }
+  if (_liveCameraSession) {
+    fetch(`${BASE}/api/devices/${encodeURIComponent(_liveCameraSerial || "")}/camera/webrtc/${encodeURIComponent(_liveCameraSession)}`, { method: "DELETE", keepalive: true }).catch(() => {});
+    _liveCameraSession = null;
+  }
+  _liveCameraSerial = null;
+  const frame = document.getElementById("camera-live-frame");
+  frame?.classList.remove("is-live");
+  frame?.querySelector("video")?.remove();
+  const placeholder = document.getElementById("camera-live-placeholder");
+  if (placeholder) placeholder.style.display = "";
+  const start = document.getElementById("camera-live-start");
+  if (start) { start.textContent = "Click to start live view"; start.disabled = false; start.hidden = false; }
+  const stop = document.getElementById("camera-live-stop");
+  if (stop) stop.hidden = true;
+  const sound = document.getElementById("camera-live-sound");
+  if (sound) sound.hidden = true;
+  const status = document.getElementById("camera-live-status");
+  if (status) status.textContent = "";
+  const vp8Hint = document.getElementById("camera-windows-vp8-hint");
+  if (vp8Hint) vp8Hint.hidden = true;
+  if (powerOwner) releaseCameraPower(powerOwner.serial, powerOwner);
+}
 function openDeviceModal(device) {
+  stopLiveCamera();
   _currentDevice = device;
   _currentDeviceTab = "overview";
 
@@ -9,7 +77,7 @@ function openDeviceModal(device) {
     : "");
   imgEl.innerHTML = imageUrl
     ? `<img src="${escHtml(imageUrl)}" alt="">`
-    : `<span>${deviceIcon(device)}</span>`;
+    : `<span class="material-icons">${deviceIcon(device)}</span>`;
 
   document.getElementById("detail-name").textContent = device.name || device.device_type || device.serial;
   document.getElementById("detail-room").textContent = device.room || "";
@@ -40,7 +108,7 @@ function openDeviceModal(device) {
   const powerEl = document.getElementById("detail-power");
   if (device.device_type === "one_rfid" && device.electricQuantity != null && device.electricQuantity > 0) {
     const onAC = device.powerType !== 2;
-    powerEl.textContent = onAC ? `🔌 ${t("power.ac")}` : `🔋 ${device.electricQuantity}%`;
+    powerEl.innerHTML = onAC ? `<span class="material-icons">electric_plug</span> ${t("power.ac")}` : `<span class="material-icons">battery_charging</span> ${device.electricQuantity}%`;
     powerEl.style.display = "";
   } else {
     powerEl.style.display = "none";
@@ -52,37 +120,55 @@ function openDeviceModal(device) {
   const clockEl = document.getElementById("detail-clock");
   const off = device.clock_offset_secs;
   if (device.online && off != null) {
-    const mag = Math.abs(off) >= 120 ? `${Math.round(Math.abs(off) / 60)}m` : `${Math.abs(off)}s`;
-    clockEl.textContent = Math.abs(off) <= 30 ? `🕒 ${t("clock.synced")}`
-      : off > 0 ? `🕒 ${t("clock.slow", { n: mag })}` : `🕒 ${t("clock.fast", { n: mag })}`;
-    clockEl.style.display = "";
+    if (Math.abs(off) <= 30) {
+      clockEl.style.display = "none";
+    } else {
+      const mag = Math.abs(off) >= 120 ? `${Math.round(Math.abs(off) / 60)}m` : `${Math.abs(off)}s`;
+      clockEl.innerHTML = off > 0 ? `${t("clock.slow", { n: mag })}` : `${t("clock.fast", { n: mag })}`;
+      clockEl.style.display = "";
+    }
   } else {
     clockEl.style.display = "none";
   }
 
   const isFeeder = device.device_type === "one_rfid" || device.device_type === "granary" || device.device_type === "camera_feeder";
   const isFountain = device.device_type?.startsWith("dockstream");
+  document.getElementById("device-tabs").style.display = device.online ? "" : "none";
   document.querySelectorAll(".dtab").forEach(b => {
     b.classList.toggle("active", b.dataset.dtab === "overview");
     if (b.dataset.dtab === "log") b.style.display = "";
     if (b.dataset.dtab === "schedule") b.style.display = isFeeder ? "" : "none";
     if (b.dataset.dtab === "led") b.style.display = device.device_type === "one_rfid" ? "" : "none";
     if (b.dataset.dtab === "controls") b.style.display = isFountain ? "" : "none";
+    if (b.dataset.dtab === "camera") b.style.display = "none";
+    if (b.dataset.dtab === "sensors") b.style.display = device.device_type === "camera_feeder" ? "" : "none";
+    if (b.dataset.dtab === "camera-sound") b.style.display = "none";
     if (b.dataset.dtab === "maintenance") b.style.display = "";
   });
 
   renderDeviceTab("overview");
 
-  document.getElementById("btn-detail-delete").onclick = () => deleteDevice(device.serial);
   document.getElementById("btn-detail-edit").onclick = openEditDevice;
   document.getElementById("modal-device").classList.add("open");
 }
 
 function renderDeviceTab(tabName) {
+  // Accept former internal keys used by cached markup or older integrations.
+  if (["device-settings", "options", "camera-motion", "camera-video"].includes(tabName)) tabName = "sensors";
+  if (tabName === "camera-sound") tabName = "overview";
+  if (_currentDevice && !_currentDevice.online) {
+    _currentDeviceTab = "offline";
+    document.getElementById("device-tabs").style.display = "none";
+    document.getElementById("dtab-content").innerHTML = buildOfflineTroubleshooting();
+    return;
+  }
+  document.getElementById("device-tabs").style.display = "";
+  if (tabName !== "overview" || _currentDevice.device_type !== "camera_feeder") stopCameraTalk();
   _currentDeviceTab = tabName;
   const content = document.getElementById("dtab-content");
   if (tabName === "overview") content.innerHTML = buildOverviewTab(_currentDevice);
   else if (tabName === "controls") content.innerHTML = buildControlsTab(_currentDevice);
+  else if (tabName === "sensors") content.innerHTML = buildCameraSettingsTab(_currentDevice, "sensors");
   else if (tabName === "led") content.innerHTML = buildLedTab(_currentDevice);
   else if (tabName === "maintenance") content.innerHTML = buildMaintenanceTab(_currentDevice);
   else if (tabName === "log") {
@@ -117,6 +203,108 @@ function renderDeviceTab(tabName) {
   wireDeviceTabHandlers(tabName);
 }
 
+function buildOfflineTroubleshooting() {
+  return `<section class="offline-help">
+    <h2>${escHtml(t("device.offline_help_title"))}</h2>
+    <p>${escHtml(t("device.offline_help_intro"))}</p>
+    <ol>
+      <li>${escHtml(t("device.offline_help_power"))}</li>
+      <li>${escHtml(t("device.offline_help_wifi"))}</li>
+      <li>${escHtml(t("device.offline_help_restart"))}</li>
+    </ol>
+    <p class="offline-help-note">${escHtml(t("device.offline_help_wait"))}</p>
+  </section>`;
+}
+
+function buildCameraStorageStatus(device) {
+  const number = value => (typeof value === "number" && Number.isInteger(value) && value >= 0) || (typeof value === "string" && /^\d{1,20}$/.test(value)) ? Number(value) : null;
+  const state = number(device.sdCardState), total = number(device.sdCardTotalCapacity), used = number(device.sdCardUsedCapacity);
+  const mb = value => value === null ? "Unknown" : `${value} MB`;
+  const status = ({0: "Not available", 1: "Available", 2: "Initializing"})[state] || "Unknown";
+  const free = total !== null && used !== null && used <= total ? total - used : null;
+  return `<section class="camera-settings-section"><header class="camera-settings-header"><h3>SD card</h3></header><div class="camera-settings-body">
+    <p class="form-hint">Last reported by the feeder.</p>
+    <div class="form-row"><span>Status</span><strong>${escHtml(status)}</strong></div>
+    <div class="form-row"><span>Filesystem</span><strong>${escHtml(typeof device.sdCardFileSystem === "string" ? device.sdCardFileSystem : "Unknown")}</strong></div>
+    <div class="form-row"><span>Total / Used / Free</span><strong>${escHtml(`${mb(total)} / ${mb(used)} / ${mb(free)}`)}</strong></div>
+    <div class="form-row"><span>Recording capability</span><strong>${device.enableVideoRecord === true ? "Supported" : device.enableVideoRecord === false ? "Unavailable" : "Unknown"}</strong></div>
+  </div></section>`;
+}
+
+function buildCameraSettingsTab(device, category = "all") {
+  const row = (label, field, value, type = "text", extra = "") => `<div class="form-row"><label class="form-label">${label}</label><input class="form-input" data-camera-setting="${field}" type="${type}" value="${escHtml(String(value ?? ""))}" ${extra}></div>`;
+  const choice = (label, field, value, options) => `<div class="form-row"><label class="form-label">${label}</label><select class="form-select" data-camera-setting="${field}">${options.map(([v, text]) => `<option value="${v}" ${String(value) === String(v) ? "selected" : ""}>${text}</option>`).join("")}</select></div>`;
+  const section = (title, field, enabled, content, options = {}) => `<section class="camera-settings-section">
+    <header class="camera-settings-header"><h3>${title}</h3><button type="button" class="toggle-switch ${enabled ? "sw-on" : "sw-off"}" data-camera-setting="${field}" data-toggle="true" aria-label="Enable ${title}" ${options.toggleHidden ? "hidden" : ""}></button></header>
+    <div class="camera-settings-body" ${enabled || options.bodyOpen ? "" : "hidden"}>${content}</div>
+    ${options.trailing || ""}
+  </section>`;
+  const schedule = (name, agingField, agingType, startField, startValue, endField, endValue, leadingControl = "", trailingControl = "") => {
+    const scheduled = Number(agingType ?? 1) === 2;
+    return `<div class="camera-sound-controls">${leadingControl}<label class="small-toggle-row"><span>Schedule</span><input class="small-toggle" type="checkbox" data-camera-setting="${agingField}" data-toggle-kind="all-day" ${scheduled ? "checked" : ""}></label>${trailingControl}</div>
+      <div class="camera-time-grid" data-schedule-times="${name}" ${scheduled ? "" : "hidden"}>
+        ${row("", startField, startValue, "time")}<span class="camera-time-separator">to</span>${row("", endField, endValue, "time")}
+      </div>`;
+  };
+  const show = name => category === "all" || category === name ||
+    (category === "sensors" && ["video", "sound-detection", "motion", "recording", "feeding-video"].includes(name)) ||
+    (category === "overview" && ["sound", "indicators"].includes(name));
+  const utcToLocalOrEmpty = value => value ? _utcToLocal(value) : "";
+  const powerWithLiveView = device.camera_power_with_live_view === true;
+  const powerWithLiveViewControl = `<div class="camera-ha-expose-row">
+      <div class="camera-ha-expose-copy">
+        <span class="camera-ha-expose-label">${t("settings.camera_power_with_live_view")}</span>
+        <p class="camera-ha-expose-hint">${t("settings.camera_power_with_live_view_hint")}</p>
+      </div>
+      <button type="button" id="camera-power-with-live-view" role="switch" aria-checked="${powerWithLiveView}" aria-label="${t("settings.camera_power_with_live_view")}" class="toggle-switch camera-ha-expose-toggle ${powerWithLiveView ? "sw-on" : "sw-off"}"></button>
+    </div>`;
+  const exposureControl = `<div class="camera-ha-expose-row" id="camera-ha-expose-row" ${powerWithLiveView ? "hidden" : ""}>
+      <div class="camera-ha-expose-copy">
+        <span class="camera-ha-expose-label">Live Camera in Home Assistant</span>
+        <p class="camera-ha-expose-hint">Adds or removes a separate live camera entity in Home Assistant. Can use more CPU. The snapshot camera is available either way.</p>
+        <span id="camera-ha-expose-status" role="status" class="camera-ha-expose-status"></span>
+      </div>
+      <button type="button" id="camera-ha-expose" role="switch" aria-checked="${device.live_camera_exposed === true}" aria-label="Live Camera in Home Assistant" class="toggle-switch camera-ha-expose-toggle ${device.live_camera_exposed === true ? "sw-on" : "sw-off"}"></button>
+    </div>`;
+  return `${show("video") ? section("Camera", "cameraSwitch", device.cameraSwitch !== false, `
+      <div class="camera-settings-grid">${choice(t("settings.camera_resolution"), "resolution", device.resolution || "P1080", [["P1080","1080p"],["P720","720p"]])}${choice(t("settings.camera_night_vision"), "nightVision", device.nightVision || "OPEN", [["AUTOMATIC","Automatic"],["OPEN","Always on"],["CLOSE","Off"]])}</div>
+      ${schedule("camera", "cameraAgingType", device.cameraAgingType, "cameraStartTime", device.camera_start_local || "00:00", "cameraEndTime", device.camera_end_local || "23:59", "", `<label class="small-toggle-row"><span>PetLibro Watermark &amp; Time</span><input class="small-toggle" type="checkbox" data-camera-setting="videoWatermarkSwitch" ${device.videoWatermarkSwitch !== false ? "checked" : ""}></label>`)}
+    `, { toggleHidden: powerWithLiveView, bodyOpen: powerWithLiveView, trailing: powerWithLiveViewControl + exposureControl }) : ""}
+    ${show("indicators") ? section("Indicator lights", "lightSwitch", device.lightSwitch !== false, `
+      ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
+      <p class="form-hint">Lights stay on all day with Schedule off. With Schedule on, choose the hours when indicator lights are enabled. Hours use the configured feeder timezone.</p>
+    `) : ""}
+    ${show("recording") ? buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
+      <p class="form-hint">The feeder saves video to its SD card. Motion recording also requires Motion Detection to be enabled with overlapping hours.</p>
+      ${choice("Recording mode", "videoRecordMode", device.videoRecordMode || "CONTINUOUS", [["CONTINUOUS", "Continuous"], ["MOTION_DETECTION", "Motion detection"]])}
+      ${schedule("recording", "videoRecordAgingType", device.videoRecordAgingType, "videoRecordStartTime", device.videoRecordStartTime || utcToLocalOrEmpty(device.videoRecordStartTimeUtc) || "00:00", "videoRecordEndTime", device.videoRecordEndTime || utcToLocalOrEmpty(device.videoRecordEndTimeUtc) || "23:59")}
+      <p class="form-hint">Hours use the configured feeder timezone. Overnight schedules are supported.</p>
+    `) : ""}
+    ${show("feeding-video") ? section("Feeding video", "feedingVideoSwitch", device.feedingVideoSwitch === true, `
+      <label class="small-toggle-row"><span>Record scheduled feeding</span><input class="small-toggle" type="checkbox" data-camera-setting="enableVideoStartFeedingPlan" ${device.enableVideoStartFeedingPlan === true ? "checked" : ""}></label>
+      ${row("Minutes before scheduled feeding", "beforeFeedingPlanTime", device.beforeFeedingPlanTime ?? 1, "number", 'min="1" max="5" step="1"')}
+      ${row("Automatic recording duration (minutes)", "automaticRecording", device.automaticRecording ?? 1, "number", 'min="1" max="5" step="1"')}
+      <label class="small-toggle-row"><span>Record after manual feeding</span><input class="small-toggle" type="checkbox" data-camera-setting="enableVideoAfterManualFeeding" ${device.enableVideoAfterManualFeeding === true ? "checked" : ""}></label>
+      ${row("Minutes after manual feeding", "afterManualFeedingTime", device.afterManualFeedingTime ?? 1, "number", 'min="1" max="5" step="1"')}
+    `) : ""}
+    ${show("sound") ? section(t("settings.sound_tab"), "soundSwitch", device.soundSwitch !== false, `
+      ${schedule("sound", "soundAgingType", device.soundAgingType, "soundStartTime", device.sound_start_local || "00:00", "soundEndTime", device.sound_end_local || "23:59", `
+        <div class="camera-volume-control">
+          <label class="form-label" for="camera-sound-volume">${t("settings.sound_volume")} <output for="camera-sound-volume">${device.volume ?? 50}</output></label>
+          <input id="camera-sound-volume" data-camera-setting="volume" type="range" min="0" max="100" step="1" value="${device.volume ?? 50}">
+        </div>`)}
+    `) : ""}
+    ${show("motion") ? section("Motion Detection", "motionDetectionSwitch", device.motionDetectionSwitch !== false, `
+      <div class="camera-settings-grid">${choice("Sensitivity", "motionDetectionSensitivity", device.motionDetectionSensitivity || "MEDIUM", [["LOW","Low"],["MEDIUM","Medium"],["HIGH","High"]])}${choice("Range", "motionDetectionRange", device.motionDetectionRange || "MEDIUM", [["SMALL","Small"],["MEDIUM","Medium"],["LARGE","Large"]])}</div>
+      ${schedule("motion", "motionDetectionAgingType", device.motionDetectionAgingType, "motionDetectionStartTime", device.motion_start_local || "00:00", "motionDetectionEndTime", device.motion_end_local || "23:59")}
+    `) : ""}
+    ${show("sound-detection") ? section(t("settings.sound_detection"), "soundDetectionSwitch", device.soundDetectionSwitch !== false, `
+      <div class="camera-settings-grid">${choice(t("settings.sound_detection_sensitivity"), "soundDetectionSensitivity", device.soundDetectionSensitivity || "MEDIUM", [["LOW","Low"],["MEDIUM","Medium"],["HIGH","High"]])}</div>
+      ${schedule("sound-detection", "soundDetectionAgingType", device.soundDetectionAgingType, "soundDetectionStartTime", device.sound_detection_start_local || utcToLocalOrEmpty(device.soundDetectionStartTimeUtc) || "00:00", "soundDetectionEndTime", device.sound_detection_end_local || utcToLocalOrEmpty(device.soundDetectionEndTimeUtc) || "23:59")}
+    `) : ""}
+    <p class="form-hint" id="camera-settings-status" role="status"></p>${category === "sensors" ? `<p class="form-hint">Sound &amp; motion sensors can be configured as triggers in Home Assistant.</p>` : ""}`;
+}
+
 // ── Overview tab ──────────────────────────────────────────────────────────
 function buildOverviewTab(device) {
   const filterDays = filterDaysRemaining(device);
@@ -142,7 +330,7 @@ function buildOverviewTab(device) {
     if (pets.length) {
       const rows = pets.map(p => `
       <div class="intake-row">
-        <div class="intake-avatar">${p.image_url ? `<img src="${escHtml(p.image_url)}" alt="${escHtml(p.name)}">` : "🐾"}</div>
+        <div class="intake-avatar">${p.image_url ? `<img src="${escHtml(p.image_url)}" alt="${escHtml(p.name)}">` : `<span class="material-icons">pets</span>`}</div>
         <div class="intake-info">
           <div class="intake-name">${escHtml(p.name || t("pet.unnamed"))}</div>
           <div class="intake-stats">${p.visits ? t("overview.pet_intake_stats", {duration: fmtDuration(p.duration_secs || 0), n: p.visits}) : t("overview.pet_intake_none")}</div>
@@ -167,7 +355,6 @@ function buildOverviewTab(device) {
     const closeSec   = device.closeDoorTimeSec ?? 10;
     const childLock  = device.childLockSwitch  ?? false;
     const soundOn    = device.soundSwitch !== false;
-    const volume     = device.volume ?? 50;
     const foodLabel = foodOk === false ? t("food.low") : foodOk === true ? t("food.ok") : "—";
     const battPct  = hasBattery
       ? `${device.electricQuantity}% (${powerIsAC ? t("power.ac") : t("power.battery")})`
@@ -225,11 +412,12 @@ function buildOverviewTab(device) {
       <div class="form-row" style="align-items:center;gap:16px;flex-wrap:wrap;margin-top:8px">
         <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
           <input type="checkbox" id="feeder-sound-switch" ${soundOn ? "checked" : ""}> ${t("overview.sound")}
-          <input class="form-input" id="feeder-volume" type="number" min="0" max="100" value="${volume}" style="width:72px;margin-left:4px">
         </label>
+        ${device.device_type !== "camera_feeder" ? `
         <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
           <input type="checkbox" id="feeder-child-lock" ${childLock ? "checked" : ""}> ${t("overview.child_lock")}
         </label>
+        ` : ''}
       </div>
       ${_hoursBlock("hrs-sound", t("hours.sound_heading"),
           device.sound_hours_mode || (device.soundAgingType === 2 ? "custom" : "all"),
@@ -254,8 +442,31 @@ function buildOverviewTab(device) {
     const battLabel  = hasBattery ? `${device.electricQuantity}%` : "—";
     const lightOn    = !!device.lightSwitch;
     const lockOn     = !!device.disableHardwareButton;
-    const volume     = device.volume ?? 50;
-    return `<div class="detail-stats">
+    const ua = navigator.userAgent || "";
+    const platform = navigator.userAgentData?.platform || navigator.platform || "";
+    const brands = navigator.userAgentData?.brands?.map(brand => brand.brand).join(" ") || "";
+    const isWindowsChrome = /windows/i.test(`${platform} ${ua}`)
+      && (/chrome/i.test(brands) || /Chrome\//.test(ua))
+      && !/Edg|OPR|Opera/i.test(`${brands} ${ua}`);
+    const liveCameraHtml = device.device_type === "camera_feeder" ? `<section class="overview-live-camera">
+      ${isWindowsChrome ? `<div class="detail-stat" id="camera-windows-vp8-hint" hidden>${t("camera.windows_vp8_hint")}</div>` : ""}
+      <div class="tab-section-heading">Live camera</div>
+      <div class="overview-live-camera-frame" id="camera-live-frame">
+        <button type="button" class="overview-live-camera-start" id="camera-live-start">Click to start live view</button>
+        <div class="overview-live-camera-controls" id="camera-live-controls" aria-label="Live camera settings">
+          <label title="Resolution"><span class="material-icons" aria-hidden="true">high_quality</span><select id="camera-live-resolution" aria-label="Resolution"><option value="P1080">1080p</option><option value="P720">720p</option></select></label>
+          <label title="Night vision"><span class="material-icons" aria-hidden="true">nightlight</span><select id="camera-live-night-vision" aria-label="Night vision"><option value="AUTOMATIC">Auto</option><option value="OPEN">On</option><option value="CLOSE">Off</option></select></label>
+          <button type="button" class="overview-live-camera-sound" id="camera-live-sound" aria-label="Turn camera sound on" title="Turn sound on" hidden><span class="material-icons" aria-hidden="true">volume_off</span></button>
+          <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
+        </div>
+        <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
+        <button type="button" class="btn-secondary" id="camera-talk-toggle" aria-label="Talk" aria-pressed="false" aria-describedby="camera-talk-status"><span class="material-icons" aria-hidden="true">mic</span></button>
+        <span id="camera-talk-status" class="form-hint" role="status" aria-live="polite">Use your microphone to talk to the feeder.</span>
+      </div>
+    </section>` : "";
+    return `${liveCameraHtml}<div class="detail-stats">
       <div class="detail-stat" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.food_level")}</div>
         <div class="detail-stat-value ${foodClass}">${foodLabel}</div>
@@ -284,15 +495,14 @@ function buildOverviewTab(device) {
         <span class="toggle-label">${t("overview.light")}</span>
         <button class="toggle-switch ${lightOn ? "sw-on" : "sw-off"}" id="ctrl-granary-light"></button>
       </div>
+      ${device.device_type !== "camera_feeder" ? `
       <div class="toggle-row">
         <span class="toggle-label">${t("overview.buttons_lock")}</span>
         <button class="toggle-switch ${lockOn ? "sw-on" : "sw-off"}" id="ctrl-granary-lock"></button>
       </div>
+      ` : ''}
     </div>
-    <div class="form-row" style="margin-top:8px">
-      <label class="form-label">${t("overview.volume")}</label>
-      <input class="form-input" id="feeder-granary-volume" type="number" min="0" max="100" value="${volume}">
-    </div>`;
+    ${device.device_type === "camera_feeder" ? buildCameraSettingsTab(device, "overview") : ""}`;
   }
 
   return `<div class="detail-stats">
@@ -339,6 +549,10 @@ function buildControlsTab(device) {
   const waterDuration = device.useWaterDuration ?? 15;
   const lightStart = device.light_start_time || "08:00";
   const lightEnd = device.light_end_time || "20:00";
+  const soundSwitch = device.soundSwitch;
+  const soundVolume = device.volume ?? 50;
+  const motionDetection = device.motionDetectionSwitch;
+  const cameraOn = device.cameraSwitch;
   // lightAgingType 1=static/manual, 2=scheduled. Confirmed working on real
   // hardware, both directions -- see toggles.js's toggleLightScheduleEnabled
   // for the history of what it took to get here.
@@ -393,6 +607,42 @@ function buildControlsTab(device) {
   </div>
   <button class="btn-primary" id="btn-apply-light-schedule">${t("overview.apply_light_schedule")}</button>
   <p class="form-hint">${t("overview.light_schedule_enabled_hint")}</p>
+
+  <!-- Sound settings -->
+  <div class="form-row" style="margin-top:12px">
+    <label class="form-label">${t("settings.sound_switch")}</label>
+    <button class="toggle-switch ${soundSwitch !== false ? "sw-on" : "sw-off"}" id="ctrl-sound-switch"></button>
+    <input class="form-input" id="ctrl-sound-volume" type="number" min="0" max="100" value="${soundVolume}" style="width:72px;margin-left:4px">
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.sound_volume")}</label>
+  </div>
+  <div class="form-row" style="margin-top:8px">
+    <label class="form-label">${t("settings.sound_aging_type")}</label>
+    <select class="form-input" id="ctrl-sound-aging-type">
+      <option value="1" ${soundVolume > 0 || soundSwitch ? "" : ""}>${t("hours.all_day")}</option>
+      <option value="2" ${soundSwitch && soundVolume > 0 ? "selected" : ""}>${t("hours.custom")}</option>
+    </select>
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.sound_aging_type_hint")}</label>
+  </div>
+
+  <!-- Motion detection settings -->
+  <div class="form-row" style="margin-top:12px">
+    <label class="form-label">${t("settings.motion_detection_switch")}</label>
+    <button class="toggle-switch ${motionDetection !== false ? "sw-on" : "sw-off"}" id="ctrl-motion-switch"></button>
+    <input class="form-input" id="ctrl-motion-sensitivity" type="number" min="1" max="10" value="${device.motionSensitivity ?? 5}" style="width:50px;margin-left:4px">
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.motion_sensitivity")}</label>
+    <input class="form-input" id="ctrl-motion-range" type="number" min="1" max="100" value="${device.motionRange ?? 50}" style="width:50px;margin-left:4px">
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.motion_range")}</label>
+  </div>
+
+  <!-- Camera settings -->
+  <div class="form-row" style="margin-top:12px">
+    <label class="form-label">${t("settings.camera_switch")}</label>
+    <button class="toggle-switch ${cameraOn !== false ? "sw-on" : "sw-off"}" id="ctrl-camera-switch"></button>
+    <input class="form-input" id="ctrl-camera-resolution" type="text" value="${device.cameraResolution ?? "1080p"}" style="width:120px;margin-left:4px">
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.camera_resolution")}</label>
+    <input class="form-input" id="ctrl-camera-night-vision" type="checkbox" ${device.cameraNightVision !== false ? "checked" : ""} style="margin-left:4px">
+    <label class="form-label" style="margin-left:8px;color:var(--pl-subtext)">${t("settings.camera_night_vision")}</label>
+  </div>
 
   <div class="tab-section-heading" style="margin-top:18px">${t("overview.calibrate_scale")}</div>
   <button class="btn-secondary" id="btn-calibrate-scale">${t("overview.calibrate_scale")}</button>
@@ -502,18 +752,7 @@ function buildMaintenanceTab(device) {
     <div style="display:flex;gap:8px;margin-bottom:18px">
       <input class="form-input" id="maint-housing-interval" type="number" min="1" max="365" value="${device.housing_cleaning_interval_days ?? 30}" style="flex:1">
       <button class="btn-secondary" id="btn-record-housing" style="flex-shrink:0">${t("maint.record_housing")}</button>
-    </div>
-
-    <div class="tab-section-heading">${t("maint.feed_sounds")}</div>
-    <p class="form-hint">${t("maint.feed_sounds_hint")}</p>
-    <div class="form-row">
-      <label class="form-label">${t("maint.feed_sound_select")}</label>
-      <select class="form-select" id="maint-audio-select">
-        <option value="" data-i18n="maint.feed_sound_loading">${t("maint.feed_sound_loading")}</option>
-      </select>
-    </div>
-    <button class="btn-secondary" id="btn-push-audio" style="width:100%">${t("maint.push_sound")}</button>
-    <p class="form-hint" id="maint-audio-status"></p>`;
+    </div>`;
   }
 
   const filterDays = filterDaysRemaining(device);
@@ -571,10 +810,11 @@ function buildMaintenanceTab(device) {
   <p class="form-hint">${t("maint.min_drink_hint")}</p>`;
 }
 
-// ── Custom feed sounds (feeder maintenance tab) ────────────────────────────
+// ── Custom feed sounds (feeder schedule tab) ───────────────────────────────
 async function _wireFeedSoundControls(device, selectEl) {
   const statusEl = document.getElementById("maint-audio-status");
   const pushBtn  = document.getElementById("btn-push-audio");
+  const repetitionsEl = document.getElementById("maint-audio-repetitions");
 
   async function refreshList() {
     try {
@@ -592,10 +832,12 @@ async function _wireFeedSoundControls(device, selectEl) {
     pushBtn.onclick = async () => {
       const name = selectEl.value;
       if (!name) { statusEl.textContent = t("maint.feed_sound_select_first"); return; }
+      const soundRepititions = Math.max(1, Math.min(5, Number(repetitionsEl?.value) || 1));
+      if (repetitionsEl) repetitionsEl.value = soundRepititions;
       pushBtn.disabled = true;
       statusEl.textContent = t("maint.pushing");
       try {
-        await api("POST", `/api/devices/${device.serial}/push-audio`, { name });
+        await api("POST", `/api/devices/${device.serial}/push-audio`, { name, soundRepititions });
         statusEl.textContent = t("maint.push_success");
       } catch(e) {
         statusEl.textContent = t("maint.push_failed", {error: e.message});
@@ -611,7 +853,7 @@ function buildLogTab(device, history) {
   const hasData = history && history.some(d => d.grams > 0);
   if (!hasData) {
     return `<div style="text-align:center;padding:32px 0">
-      <div style="font-size:40px;margin-bottom:8px">💧</div>
+      <div style="font-size:40px;margin-bottom:8px"><span class="material-icons">water_drop</span></div>
       <p class="form-hint">${t("log.no_intake")}</p>
     </div>`;
   }
@@ -641,7 +883,7 @@ function buildLogTab(device, history) {
 function buildFeederLogTab(device, entries) {
   if (!entries || !entries.length) {
     return `<div style="text-align:center;padding:32px 0">
-      <div style="font-size:40px;margin-bottom:8px">🐾</div>
+      <div style="font-size:40px;margin-bottom:8px"><span class="material-icons">pets</span></div>
       <p class="form-hint">${t("log.no_activity")}</p>
     </div>`;
   }
@@ -680,7 +922,7 @@ function buildFeederLogTab(device, entries) {
 function buildFountainLogTab(device, entries) {
   if (!entries || !entries.length) {
     return `<div style="text-align:center;padding:32px 0">
-      <div style="font-size:40px;margin-bottom:8px">💧</div>
+      <div style="font-size:40px;margin-bottom:8px"><span class="material-icons">water_drop</span></div>
       <p class="form-hint">${t("log.no_activity")}</p>
     </div>`;
   }
@@ -871,7 +1113,7 @@ function buildScheduleTab(plans) {
       <div class="sched-actions">
         ${skipped || _nextOccurrenceDayOffset(plan) !== null ? `<button class="sched-skip-btn" data-idx="${i}" title="${t(skipped ? "schedule.undo_skip" : "schedule.skip_today")}" style="background:none;border:1px solid ${skipped ? "var(--pl-warning)" : "var(--pl-border)"};border-radius:6px;cursor:pointer;padding:3px 8px;font-size:12px;line-height:1.2;color:${skipped ? "var(--pl-warning)" : "var(--pl-text)"}">${t(skipped ? "schedule.undo_btn" : "schedule.skip_btn")}</button>` : ""}
         <button class="sched-toggle${enabled?" on":""}" data-idx="${i}" title="${enabled?"Disable":"Enable"}"></button>
-        <button class="sched-edit-btn" data-idx="${i}" title="Edit">✏️</button>
+        <button class="sched-edit-btn" data-idx="${i}" title="Edit"><span class="material-icons">edit</span></button>
         <button class="sched-del-btn" data-idx="${i}" title="Delete" style="background:none;border:none;cursor:pointer;padding:4px;color:var(--pl-danger,#e05252);font-size:16px;line-height:1;opacity:0.8">&#x2715;</button>
       </div>
     </div>`;
@@ -928,6 +1170,26 @@ function buildScheduleTab(plans) {
       <button class="btn-secondary" id="btn-calibrate-feed" style="flex:1">${t("maint.calibrate_feed")}</button>
       ${_currentDevice.calibrated_grams_per_portion ? `<button class="btn-secondary" id="btn-reset-feed-calibration" style="flex-shrink:0;color:var(--pl-danger)">${t("maint.reset_calibration")}</button>` : ""}
     </div>` : "";
+  const audioSection = (_currentDevice?.device_type === "one_rfid" || _currentDevice?.device_type === "granary" || _currentDevice?.device_type === "camera_feeder") ? `
+    <div class="tab-section-heading" style="margin-top:18px">${t("maint.feed_sounds")}</div>
+    <p class="form-hint">${t("maint.feed_sounds_hint")}</p>
+    <div class="feed-sound-controls">
+      <div class="feed-sound-field">
+        <label class="form-label" for="maint-audio-select">${t("maint.feed_sound_select")}</label>
+        <select class="form-select" id="maint-audio-select">
+          <option value="" data-i18n="maint.feed_sound_loading">${t("maint.feed_sound_loading")}</option>
+        </select>
+      </div>
+      <div class="feed-sound-field">
+        <label class="form-label" for="maint-audio-repetitions">${t("maint.default_repititions")}</label>
+        <input class="form-input" id="maint-audio-repetitions" type="number" min="1" max="5" value="${_currentDevice.soundRepititions ?? 1}">
+      </div>
+      <div class="feed-sound-field">
+        <span class="form-label" aria-hidden="true">&nbsp;</span>
+        <button class="btn-secondary" id="btn-push-audio" aria-label="${t("maint.push_sound")}">${t("maint.push_sound")}</button>
+      </div>
+    </div>
+    <p class="form-hint" id="maint-audio-status"></p>` : "";
 
   const _paused = !!_currentDevice?.schedules_paused;
   const pauseRow = `<div class="toggle-row">
@@ -942,7 +1204,8 @@ function buildScheduleTab(plans) {
     ${form}
     <div class="sched-list" id="sched-list">${rows || `<p style="color:var(--pl-subtext);text-align:center;padding:12px 0">${t("schedule.no_plans")}</p>`}</div>
     <p style="font-size:11px;color:var(--pl-subtext);margin-top:4px">${t("schedule.sync_note")}</p>
-    ${calSection}`;
+    ${calSection}
+    ${audioSection}`;
 }
 
 // In-memory plans for schedule tab editing
@@ -957,6 +1220,9 @@ function wireScheduleTabHandlers() {
   const list = document.getElementById("sched-list");
   const form = document.getElementById("sched-form");
   if (!list || !form) return;
+
+  const audioSelect = document.getElementById("maint-audio-select");
+  if (audioSelect) _wireFeedSoundControls(_currentDevice, audioSelect);
 
   const runAll = document.getElementById("sched-run-all");
   if (runAll) {
@@ -1089,6 +1355,7 @@ function wireScheduleTabHandlers() {
     const enableAudio = document.getElementById("sf-sound").checked;
     const audioTimes = +document.getElementById("sf-sound-times").value || 1;
     const editIdx = document.getElementById("sf-edit-idx").value;
+    const previousPlans = _schedPlans.map(plan => ({...plan}));
     const planData = {
       planId: editIdx !== "" ? _schedPlans[+editIdx].planId : (5000000 + Math.floor(Math.random() * 1000000)),
       executionTime: _localToUtc(time),
@@ -1106,6 +1373,12 @@ function wireScheduleTabHandlers() {
       _schedPlans.push(planData);
     }
     const result = await _saveSchedule();
+    if (!result) {
+      _schedPlans = previousPlans;
+      rerender();
+      alert(t("overview.cmd_failed", {error: "Schedule could not be saved. Please try again."}));
+      return;
+    }
     closeForm();
     rerender();
     if (result?.mqtt === false) {
@@ -1237,8 +1510,294 @@ function _wireHours(d, id, cmdKey, fields) {
   };
 }
 
+function wireCameraExposureToggle(device) {
+  const expose = document.getElementById("camera-ha-expose");
+  const exposeStatus = document.getElementById("camera-ha-expose-status");
+  if (!expose) return;
+  expose.onclick = async () => {
+    if (expose.disabled) return;
+    const enabled = expose.getAttribute("aria-checked") !== "true";
+    expose.setAttribute("aria-checked", String(enabled));
+    expose.className = `toggle-switch camera-ha-expose-toggle ${enabled ? "sw-on" : "sw-off"}`;
+    expose.disabled = true;
+    exposeStatus.textContent = enabled ? "Registering with Home Assistant…" : "Removing from Home Assistant…";
+    try {
+      await api("POST", `/api/devices/${encodeURIComponent(device.serial)}/camera/exposure`, { enabled });
+      _patchDevice(device.serial, { live_camera_exposed: enabled });
+      exposeStatus.textContent = enabled ? "Live camera added to Home Assistant." : "Live camera removed from Home Assistant.";
+    } catch (error) {
+      expose.setAttribute("aria-checked", String(!enabled));
+      expose.className = `toggle-switch camera-ha-expose-toggle ${!enabled ? "sw-on" : "sw-off"}`;
+      exposeStatus.textContent = error.message || "Could not update Home Assistant camera.";
+    } finally {
+      expose.disabled = false;
+    }
+  };
+}
+
+function wireCameraPowerWithLiveViewToggle(device) {
+  const toggle = document.getElementById("camera-power-with-live-view");
+  if (!toggle) return;
+  toggle.onclick = async () => {
+    if (toggle.disabled) return;
+    const enabled = toggle.getAttribute("aria-checked") !== "true";
+    const section = toggle.closest("section");
+    const cameraToggle = section?.querySelector('[data-camera-setting="cameraSwitch"]');
+    const body = section?.querySelector(".camera-settings-body");
+    const exposure = document.getElementById("camera-ha-expose-row");
+    const applyVisibility = value => {
+      toggle.setAttribute("aria-checked", String(value));
+      toggle.className = `toggle-switch camera-ha-expose-toggle ${value ? "sw-on" : "sw-off"}`;
+      if (cameraToggle) cameraToggle.hidden = value;
+      if (exposure) exposure.hidden = value;
+      if (body) body.hidden = !value && cameraToggle?.classList.contains("sw-off");
+    };
+    applyVisibility(enabled);
+    toggle.disabled = true;
+    try {
+      await api("POST", `/api/devices/${encodeURIComponent(device.serial)}`, { camera_power_with_live_view: enabled });
+      _patchDevice(device.serial, { camera_power_with_live_view: enabled });
+      device.camera_power_with_live_view = enabled;
+    } catch (error) {
+      applyVisibility(!enabled);
+      alert(error.message || t("overview.failed"));
+    } finally {
+      toggle.disabled = false;
+    }
+  };
+}
+
 function wireDeviceTabHandlers(tabName) {
   const d = _currentDevice;
+  if (tabName !== "overview" || d.device_type !== "camera_feeder") stopLiveCamera();
+  if (tabName === "sensors") {
+    wireCameraPowerWithLiveViewToggle(d);
+    wireCameraExposureToggle(d);
+  }
+  if (tabName === "overview" && d.device_type === "camera_feeder") {
+    wireCameraTalk(d.serial);
+    const frame = document.getElementById("camera-live-frame");
+    const start = document.getElementById("camera-live-start");
+    const status = document.getElementById("camera-live-status");
+    const placeholder = document.getElementById("camera-live-placeholder");
+    const sound = document.getElementById("camera-live-sound");
+    const controls = document.getElementById("camera-live-controls");
+    const stop = document.getElementById("camera-live-stop");
+    const resolution = document.getElementById("camera-live-resolution");
+    const nightVision = document.getElementById("camera-live-night-vision");
+    if (resolution) resolution.value = d.resolution || "P1080";
+    if (nightVision) nightVision.value = d.nightVision || "AUTOMATIC";
+    const sendCameraSetting = async (field, value) => {
+      if (!d.serial) return;
+      try {
+        await api("POST", `/api/devices/${encodeURIComponent(d.serial)}/command`, { [field]: value });
+        _patchDevice(d.serial, { [field]: value });
+        d[field] = value;
+        if (field === "resolution") {
+          const fullSelect = document.querySelector('[data-camera-setting="resolution"]');
+          if (fullSelect) fullSelect.value = value;
+        } else if (field === "nightVision") {
+          const fullSelect = document.querySelector('[data-camera-setting="nightVision"]');
+          if (fullSelect) fullSelect.value = value;
+        }
+      } catch (error) {
+        status.textContent = error.message || "Could not update camera setting.";
+      }
+    };
+    if (resolution) resolution.onchange = () => sendCameraSetting("resolution", resolution.value);
+    if (nightVision) nightVision.onchange = () => sendCameraSetting("nightVision", nightVision.value);
+    if (controls) controls.hidden = false;
+    if (stop) stop.hidden = true;
+    const setSoundState = (muted) => {
+      if (!sound) return;
+      sound.innerHTML = `<span class="material-icons" aria-hidden="true">${muted ? "volume_off" : "volume_up"}</span>`;
+      sound.title = muted ? "Turn sound on" : "Mute camera sound";
+      sound.setAttribute("aria-label", sound.title);
+    };
+    if (sound) sound.onclick = () => {
+      if (_cameraTalk) return;
+      const video = frame.querySelector("video");
+      if (!video) return;
+      video.muted = !video.muted;
+      setSoundState(video.muted);
+      if (!video.muted) video.play().catch(() => {});
+    };
+    const stopCameraView = () => {
+      stopLiveCamera(false);
+      frame?.querySelector("video")?.remove();
+      if (sound) sound.hidden = true;
+      if (placeholder) placeholder.style.display = "";
+      if (start) {
+        start.textContent = "Click to start live view";
+        start.hidden = false;
+        start.disabled = false;
+      }
+    };
+    if (stop) stop.onclick = stopCameraView;
+    if (start && frame) start.onclick = async () => {
+      // A Status rerender can replace the button while setup is still pending.
+      if (_liveCameraPc || _liveCameraPowerOwner) stopLiveCamera(false);
+      const generation = ++_liveCameraGeneration;
+      const current = () => generation === _liveCameraGeneration;
+      const powerWithLiveView = d.camera_power_with_live_view === true;
+      if (d.cameraSwitch === false && !powerWithLiveView) {
+        status.textContent = "Enable the camera to start live view.";
+        return;
+      }
+      start.disabled = true;
+      start.hidden = true;
+      status.textContent = "Connecting…";
+      if (powerWithLiveView) {
+        const owner = { serial: d.serial };
+        _liveCameraPowerOwner = owner;
+        try {
+          await acquireCameraPower(d.serial, owner);
+          if (!current()) return;
+        } catch (error) {
+          if (!current()) return;
+          releaseCameraPower(d.serial, owner);
+          _liveCameraPowerOwner = null;
+          status.textContent = error.message || "Could not turn on the camera.";
+          start.hidden = false;
+          start.disabled = false;
+          return;
+        }
+      }
+      const video = document.createElement("video");
+      video.autoplay = true; video.playsInline = true; video.muted = true;
+      video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain";
+      if (placeholder) placeholder.style.display = "none";
+      frame.prepend(video);
+      try {
+        const pc = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+        _liveCameraPc = pc;
+        const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
+        if (_settings.camera_vp8_transcoding === true) preferVP8(videoTransceiver);
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        const stream = new MediaStream();
+        pc.ontrack = event => { stream.addTrack(event.track); video.srcObject = stream; video.play().catch(() => {}); };
+        video.onloadeddata = () => {
+          if (!current()) return;
+          status.textContent = "Live"; start.hidden = true; start.disabled = false;
+          if (stop) stop.hidden = false;
+          frame.classList.add("is-live");
+          const vp8Hint = document.getElementById("camera-windows-vp8-hint");
+          if (vp8Hint) vp8Hint.hidden = _settings.camera_vp8_transcoding !== true;
+          if (sound) sound.hidden = false;
+          setSoundState(video.muted);
+          muteCameraForTalk();
+        };
+        await pc.setLocalDescription(await pc.createOffer());
+        await new Promise(resolve => {
+          if (pc.iceGatheringState === "complete") return resolve();
+          const done = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", done); resolve(); } };
+          pc.addEventListener("icegatheringstatechange", done); setTimeout(resolve, 2500);
+        });
+        if (!current()) return;
+        const response = await fetch(`${BASE}/api/devices/${encodeURIComponent(d.serial)}/camera/webrtc`, { method: "POST", headers: { "Content-Type": "application/sdp" }, body: pc.localDescription.sdp });
+        if (!current()) {
+          const staleSession = response.headers.get("X-Petlibro-WebRTC-Session");
+          if (staleSession) fetch(`${BASE}/api/devices/${encodeURIComponent(d.serial)}/camera/webrtc/${encodeURIComponent(staleSession)}`, { method: "DELETE", keepalive: true }).catch(() => {});
+          return;
+        }
+        if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
+        _liveCameraSession = response.headers.get("X-Petlibro-WebRTC-Session");
+        _liveCameraSerial = d.serial;
+        await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
+      } catch (error) {
+        if (!current()) return;
+        stopLiveCamera(false);
+        frame.classList.remove("is-live");
+        video.remove();
+        if (placeholder) { placeholder.textContent = "Camera stream unavailable."; placeholder.style.display = ""; }
+        status.textContent = error.message;
+        start.textContent = "Click to start live view";
+        start.hidden = false;
+        start.disabled = false;
+        if (stop) stop.hidden = true;
+      }
+    };
+    if (_settings.camera_auto_start_live_view === true) start?.click();
+  }
+  if (tabName === "sensors" || (tabName === "overview" && d.device_type === "camera_feeder")) {
+    const status = document.getElementById("camera-settings-status");
+    document.querySelectorAll("[data-camera-setting]").forEach(el => {
+      const field = el.dataset.cameraSetting;
+      const isToggle = el.dataset.toggle === "true";
+      let savedValue = el.type === "checkbox" ? el.checked : el.value;
+      if (el.type === "range") {
+        el.addEventListener("input", () => {
+          el.closest(".camera-volume-control").querySelector("output").value = el.value;
+        });
+      }
+      const save = async () => {
+        const previous = d[field];
+        let value = isToggle ? el.classList.contains("sw-off") : el.type === "checkbox" ? el.checked : el.value;
+        if (isToggle) {
+          el.className = `toggle-switch ${value ? "sw-on" : "sw-off"}`;
+          el.closest("section").querySelector(".camera-settings-body").hidden = !value;
+          el.disabled = true;
+        }
+        if (el.dataset.toggleKind === "all-day") {
+          value = value ? 2 : 1;
+          const scheduleName = {soundAgingType: "sound", motionDetectionAgingType: "motion", soundDetectionAgingType: "sound-detection", cameraAgingType: "camera", videoRecordAgingType: "recording", lightAgingType: "indicators"}[field];
+          const times = document.querySelector(`[data-schedule-times="${scheduleName}"]`);
+          if (times) times.hidden = !el.checked;
+        }
+        if (el.type === "number" || el.type === "range") value = Number(value);
+        const payload = { [field]: value };
+        if ((field === "videoRecordAgingType" || field === "lightAgingType") && value === 2) {
+          for (const timeField of (field === "lightAgingType" ? ["lightingStartTime", "lightingEndTime"] : ["videoRecordStartTime", "videoRecordEndTime"])) {
+            payload[timeField] = document.querySelector(`[data-camera-setting="${timeField}"]`)?.value;
+          }
+        }
+        const timeFields = {
+          soundStartTime: ["soundStartTimeUtc", "sound_start_local"],
+          soundEndTime: ["soundEndTimeUtc", "sound_end_local"],
+          motionDetectionStartTime: ["motionDetectionStartTimeUtc", "motion_start_local"],
+          motionDetectionEndTime: ["motionDetectionEndTimeUtc", "motion_end_local"],
+          soundDetectionStartTime: ["soundDetectionStartTimeUtc", "sound_detection_start_local"],
+          soundDetectionEndTime: ["soundDetectionEndTimeUtc", "sound_detection_end_local"],
+          cameraStartTime: ["cameraStartTimeUtc", "camera_start_local"],
+          cameraEndTime: ["cameraEndTimeUtc", "camera_end_local"],
+        }[field];
+        if (timeFields) {
+          const [h, m] = String(value).split(":").map(Number);
+          const utc = new Date(2000, 0, 1, h, m);
+          payload[timeFields[0]] = `${String(utc.getUTCHours()).padStart(2,"0")}:${String(utc.getUTCMinutes()).padStart(2,"0")}`;
+          payload[timeFields[1]] = value;
+        }
+        try {
+          if (el.checkValidity && !el.checkValidity()) { el.reportValidity(); return; }
+          // Recording hours are converted by the backend using the feeder timezone.
+          await api("POST", `/api/devices/${encodeURIComponent(d.serial)}/command`, payload);
+          _patchDevice(d.serial, payload);
+          savedValue = el.type === "checkbox" ? el.checked : el.value;
+          if (status) status.textContent = "";
+        } catch (e) {
+          if (!isToggle) {
+            if (el.type === "checkbox") el.checked = savedValue;
+            else el.value = savedValue;
+          }
+          if (field === "videoRecordAgingType" || field === "lightAgingType") {
+            el.checked = Number(previous ?? 1) === 2;
+            const times = document.querySelector(`[data-schedule-times="${field === "lightAgingType" ? "indicators" : "recording"}"]`);
+            if (times) times.hidden = !el.checked;
+          }
+          if (isToggle) {
+            el.className = `toggle-switch ${!value ? "sw-on" : "sw-off"}`;
+            el.closest("section").querySelector(".camera-settings-body").hidden = value;
+          }
+          if (status) status.textContent = t("overview.failed");
+          alert(t("overview.cmd_failed", {error: e.message}));
+        } finally {
+          if (isToggle) el.disabled = false;
+        }
+      };
+      el.addEventListener(isToggle ? "click" : "change", save);
+    });
+    if (tabName !== "overview") return;
+  }
   if (tabName === "controls") {
     const pump = document.getElementById("ctrl-pump");
     const light = document.getElementById("ctrl-light");
@@ -1314,6 +1873,112 @@ function wireDeviceTabHandlers(tabName) {
         setTimeout(() => { calibrateScale.textContent = orig; calibrateScale.disabled = false; }, 3500);
       };
     }
+
+    // Sound switch
+    const soundSwitchEl = document.getElementById("ctrl-sound-switch");
+    if (soundSwitchEl) {
+      soundSwitchEl.onclick = async () => {
+        const enabled = !soundSwitch;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { soundSwitch: enabled });
+          _patchDevice(d.serial, { soundSwitch: enabled });
+          soundSwitchEl.className = `toggle-switch ${enabled ? "sw-on" : "sw-off"}`;
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Sound volume
+    const soundVolumeEl = document.getElementById("ctrl-sound-volume");
+    if (soundVolumeEl) {
+      soundVolumeEl.onchange = async () => {
+        const volume = parseInt(soundVolumeEl.value) || 50;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { volume: volume });
+          _patchDevice(d.serial, { volume: volume });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Sound aging type
+    const soundAgingTypeEl = document.getElementById("ctrl-sound-aging-type");
+    if (soundAgingTypeEl) {
+      soundAgingTypeEl.onchange = async () => {
+        const mode = soundAgingTypeEl.value;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { soundAgingType: parseInt(mode) });
+          _patchDevice(d.serial, { soundAgingType: parseInt(mode) });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+
+    // Motion detection switch
+    const motionSwitchEl = document.getElementById("ctrl-motion-switch");
+    if (motionSwitchEl) {
+      motionSwitchEl.onclick = async () => {
+        const enabled = !motionDetection;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { motionDetectionSwitch: enabled });
+          _patchDevice(d.serial, { motionDetectionSwitch: enabled });
+          motionSwitchEl.className = `toggle-switch ${enabled ? "sw-on" : "sw-off"}`;
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Motion sensitivity
+    const motionSensitivityEl = document.getElementById("ctrl-motion-sensitivity");
+    if (motionSensitivityEl) {
+      motionSensitivityEl.onchange = async () => {
+        const sensitivity = parseInt(motionSensitivityEl.value) || 5;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { motionDetectionSensitivity: sensitivity });
+          _patchDevice(d.serial, { motionDetectionSensitivity: sensitivity });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Motion range
+    const motionRangeEl = document.getElementById("ctrl-motion-range");
+    if (motionRangeEl) {
+      motionRangeEl.onchange = async () => {
+        const range = parseInt(motionRangeEl.value) || 50;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { motionDetectionRange: range });
+          _patchDevice(d.serial, { motionDetectionRange: range });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+
+    // Camera switch
+    const cameraSwitchEl = document.getElementById("ctrl-camera-switch");
+    if (cameraSwitchEl) {
+      cameraSwitchEl.onclick = async () => {
+        const enabled = !cameraOn;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { cameraSwitch: enabled });
+          _patchDevice(d.serial, { cameraSwitch: enabled });
+          cameraSwitchEl.className = `toggle-switch ${enabled ? "sw-on" : "sw-off"}`;
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Camera resolution
+    const cameraResolutionEl = document.getElementById("ctrl-camera-resolution");
+    if (cameraResolutionEl) {
+      cameraResolutionEl.onchange = async () => {
+        const resolution = cameraResolutionEl.value;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { cameraResolution: resolution });
+          _patchDevice(d.serial, { cameraResolution: resolution });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+    // Camera night vision
+    const cameraNightVisionEl = document.getElementById("ctrl-camera-night-vision");
+    if (cameraNightVisionEl) {
+      cameraNightVisionEl.onchange = async () => {
+        const enabled = cameraNightVisionEl.checked;
+        try {
+          await api("POST", `/api/devices/${d.serial}/command`, { cameraNightVision: enabled });
+          _patchDevice(d.serial, { cameraNightVision: enabled });
+        } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      };
+    }
+
   }
   else if (tabName === "overview") {
     // Feeder controls
@@ -1596,9 +2261,6 @@ function wireDeviceTabHandlers(tabName) {
         setTimeout(() => { recordHousing.textContent = t("maint.record_housing"); renderDeviceTab("maintenance"); }, 1200);
       };
     }
-
-    const audioSelect = document.getElementById("maint-audio-select");
-    if (audioSelect) _wireFeedSoundControls(d, audioSelect);
 
     // Interval/life-days fields auto-save independently of the action
     // buttons below, so you can update just the interval without it also

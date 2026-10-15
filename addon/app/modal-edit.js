@@ -1,5 +1,6 @@
 // ── Edit device modal ─────────────────────────────────────────────────────
 function openEditDevice() {
+  stopCameraTalk();
   const device = _currentDevice;
   if (!device) return;
   document.getElementById("e-name").value = device.name || "";
@@ -15,7 +16,7 @@ function openEditDevice() {
     const el = document.getElementById(id);
     if (el) el.type = "password";
     const btn = document.querySelector(`[data-target="${id}"]`);
-    if (btn) btn.textContent = "👁";
+    if (btn) btn.innerHTML = '<span class="material-icons">visibility</span>';
   });
 
   // Pet assignment checkboxes
@@ -186,7 +187,7 @@ const DEVICE_MQTT_MODELS = {
   "dockstream_rfid":      "plwf305",
   "one_rfid":             "plaf301",
   "granary":              "plaf103",
-  "camera_feeder":        "plaf103",
+  "camera_feeder":        "plaf203",
 };
 const DEVICE_VARIANTS = {
   "dockstream2":          [{ value: "b", label: "Black" }, { value: "w", label: "White" }],
