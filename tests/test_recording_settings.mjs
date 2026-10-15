@@ -31,12 +31,22 @@ test('camera settings expose recording modes, hours and feeding clip parameters'
 test('SD card facts stay read-only and escaped', () => {
   const html = render({sdCardState: '1', sdCardFileSystem: '<script>bad</script>',
     sdCardTotalCapacity: '32000', sdCardUsedCapacity: '1000'});
-  assert.ok(html.includes('Available'));
+  assert.ok(!html.includes('<span>Status</span>'));
   assert.ok(html.includes('31000 MB'));
   assert.ok(html.includes('&lt;script&gt;'));
   assert.ok(!html.includes('<script>'));
   assert.ok(!html.includes('data-camera-setting="sdCardState"'));
   assert.ok(render({}).includes('Unknown'));
+});
+
+test('missing SD card shows a message instead of storage and recording controls', () => {
+  for (const sdCardState of [0, '0']) {
+    const html = render({sdCardState, videoRecordSwitch: true});
+    assert.ok(html.includes('No SD Card Detected'));
+    assert.ok(!html.includes('<h3>SD card</h3>'));
+    assert.ok(!html.includes('SD card recording'));
+    assert.ok(!html.includes('data-camera-setting="videoRecordSwitch"'));
+  }
 });
 
 test('indicator light settings display scheduled hours from UTC reports', () => {

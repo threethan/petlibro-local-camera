@@ -2,6 +2,7 @@
 let _liveCameraPc = null;
 let _liveCameraSession = null;
 let _liveCameraSerial = null;
+let _liveCameraBridge = null;
 let _liveCameraPowerOwner = null;
 let _liveCameraGeneration = 0;
 const _cameraPowerOwners = new Map();
@@ -42,12 +43,8 @@ function stopLiveCamera() {
   _liveCameraGeneration++;
   const powerOwner = _liveCameraPowerOwner;
   _liveCameraPowerOwner = null;
-  if (_liveCameraPc) { _liveCameraPc.close(); _liveCameraPc = null; }
-  if (_liveCameraSession) {
-    fetch(`${BASE}/api/devices/${encodeURIComponent(_liveCameraSerial || "")}/camera/webrtc/${encodeURIComponent(_liveCameraSession)}`, { method: "DELETE", keepalive: true }).catch(() => {});
-    _liveCameraSession = null;
-  }
-  _liveCameraSerial = null;
+  closeLiveCameraWebrtc();
+  if (_liveCameraBridge) { _liveCameraBridge.src = ""; _liveCameraBridge.remove(); _liveCameraBridge = null; }
   const frame = document.getElementById("camera-live-frame");
   frame?.classList.remove("is-live");
   frame?.querySelector("video")?.remove();
@@ -64,6 +61,14 @@ function stopLiveCamera() {
   const vp8Hint = document.getElementById("camera-windows-vp8-hint");
   if (vp8Hint) vp8Hint.hidden = true;
   if (powerOwner) releaseCameraPower(powerOwner.serial, powerOwner);
+}
+function closeLiveCameraWebrtc() {
+  if (_liveCameraPc) { _liveCameraPc.close(); _liveCameraPc = null; }
+  if (_liveCameraSession) {
+    fetch(`${BASE}/api/devices/${encodeURIComponent(_liveCameraSerial || "")}/camera/webrtc/${encodeURIComponent(_liveCameraSession)}`, { method: "DELETE", keepalive: true }).catch(() => {});
+    _liveCameraSession = null;
+  }
+  _liveCameraSerial = null;
 }
 function openDeviceModal(device) {
   stopCameraTalk();
@@ -161,6 +166,14 @@ function updateDeviceModalStatus(device) {
   badge.textContent = device.online ? t("device.online") : t("device.offline");
   badge.className = `status-badge ${device.online ? "online" : "offline"}`;
 
+  const lastFed = document.getElementById("detail-last-fed");
+  const nextFeed = document.getElementById("detail-next-feed");
+  if (lastFed && nextFeed) {
+    const timing = feedTimingValues(device);
+    lastFed.textContent = timing.lastFed;
+    nextFeed.textContent = timing.nextFeed;
+  }
+
   if (wasOnline === device.online) return;
   if (!device.online) { stopCameraTalk(); stopLiveCamera(); }
   renderDeviceTab(device.online ? "overview" : "offline");
@@ -229,15 +242,17 @@ function buildOfflineTroubleshooting() {
   </section>`;
 }
 
+function noSdCardDetected(device) {
+  return device.sdCardState === 0 || device.sdCardState === "0";
+}
+
 function buildCameraStorageStatus(device) {
   const number = value => (typeof value === "number" && Number.isInteger(value) && value >= 0) || (typeof value === "string" && /^\d{1,20}$/.test(value)) ? Number(value) : null;
-  const state = number(device.sdCardState), total = number(device.sdCardTotalCapacity), used = number(device.sdCardUsedCapacity);
+  const total = number(device.sdCardTotalCapacity), used = number(device.sdCardUsedCapacity);
   const mb = value => value === null ? "Unknown" : `${value} MB`;
-  const status = ({0: "Not available", 1: "Available", 2: "Initializing"})[state] || "Unknown";
   const free = total !== null && used !== null && used <= total ? total - used : null;
   return `<section class="camera-settings-section"><header class="camera-settings-header"><h3>SD card</h3></header><div class="camera-settings-body">
     <p class="form-hint">Last reported by the feeder.</p>
-    <div class="form-row"><span>Status</span><strong>${escHtml(status)}</strong></div>
     <div class="form-row"><span>Filesystem</span><strong>${escHtml(typeof device.sdCardFileSystem === "string" ? device.sdCardFileSystem : "Unknown")}</strong></div>
     <div class="form-row"><span>Total / Used / Free</span><strong>${escHtml(`${mb(total)} / ${mb(used)} / ${mb(free)}`)}</strong></div>
     <div class="form-row"><span>Recording capability</span><strong>${device.enableVideoRecord === true ? "Supported" : device.enableVideoRecord === false ? "Unavailable" : "Unknown"}</strong></div>
@@ -254,7 +269,7 @@ function buildCameraSettingsTab(device, category = "all") {
   </section>`;
   const schedule = (name, agingField, agingType, startField, startValue, endField, endValue, leadingControl = "", trailingControl = "") => {
     const scheduled = Number(agingType ?? 1) === 2;
-    return `<div class="camera-sound-controls">${leadingControl}<label class="small-toggle-row"><span>Schedule</span><input class="small-toggle" type="checkbox" data-camera-setting="${agingField}" data-toggle-kind="all-day" ${scheduled ? "checked" : ""}></label>${trailingControl}</div>
+    return `<div class="camera-sound-controls${name === "camera" ? " camera-schedule-controls" : ""}">${leadingControl}<label class="small-toggle-row"><span>Schedule</span><input class="small-toggle" type="checkbox" data-camera-setting="${agingField}" data-toggle-kind="all-day" ${scheduled ? "checked" : ""}></label>${trailingControl}</div>
       <div class="camera-time-grid" data-schedule-times="${name}" ${scheduled ? "" : "hidden"}>
         ${row("", startField, startValue, "time")}<span class="camera-time-separator">to</span>${row("", endField, endValue, "time")}
       </div>`;
@@ -283,13 +298,10 @@ function buildCameraSettingsTab(device, category = "all") {
       <div class="camera-settings-grid">${choice(t("settings.camera_resolution"), "resolution", device.resolution || "P1080", [["P1080","1080p"],["P720","720p"]])}${choice(t("settings.camera_night_vision"), "nightVision", device.nightVision || "OPEN", [["AUTOMATIC","Automatic"],["OPEN","Always on"],["CLOSE","Off"]])}</div>
       ${schedule("camera", "cameraAgingType", device.cameraAgingType, "cameraStartTime", device.camera_start_local || "00:00", "cameraEndTime", device.camera_end_local || "23:59", "", `<label class="small-toggle-row"><span>PetLibro Watermark &amp; Time</span><input class="small-toggle" type="checkbox" data-camera-setting="videoWatermarkSwitch" ${device.videoWatermarkSwitch !== false ? "checked" : ""}></label>`)}
     `, { toggleHidden: powerWithLiveView, bodyOpen: powerWithLiveView, trailing: powerWithLiveViewControl + exposureControl }) : ""}
-    ${show("indicators") ? `<section class="camera-settings-section">
-      ${category === "overview" ? "" : `<header class="camera-settings-header"><h3>Indicator lights</h3><button type="button" class="toggle-switch ${device.lightSwitch !== false ? "sw-on" : "sw-off"}" data-camera-setting="lightSwitch" data-toggle="true" aria-label="Enable Indicator lights"></button></header>`}
-      <div class="camera-settings-body">
-        ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
-      </div>
-    </section>` : ""}
-    ${show("recording") ? buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
+    ${show("indicators") ? section("Indicator lights", "lightSwitch", device.lightSwitch !== false, `
+      ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
+    `) : ""}
+    ${show("recording") ? noSdCardDetected(device) ? `<p class="form-hint">No SD Card Detected</p>` : buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
       <p class="form-hint">The feeder saves video to its SD card. Motion recording also requires Motion Detection to be enabled with overlapping hours.</p>
       ${choice("Recording mode", "videoRecordMode", device.videoRecordMode || "CONTINUOUS", [["CONTINUOUS", "Continuous"], ["MOTION_DETECTION", "Motion detection"]])}
       ${schedule("recording", "videoRecordAgingType", device.videoRecordAgingType, "videoRecordStartTime", device.videoRecordStartTime || utcToLocalOrEmpty(device.videoRecordStartTimeUtc) || "00:00", "videoRecordEndTime", device.videoRecordEndTime || utcToLocalOrEmpty(device.videoRecordEndTimeUtc) || "23:59")}
@@ -320,6 +332,29 @@ function buildCameraSettingsTab(device, category = "all") {
 }
 
 // ── Overview tab ──────────────────────────────────────────────────────────
+function feedTimingValues(device) {
+  const fedAt = device.last_fed_ts ? new Date(device.last_fed_ts * 1000) : null;
+  const lastFed = fedAt && !Number.isNaN(fedAt.getTime())
+    ? fedAt.toLocaleString(undefined, {dateStyle: "medium", timeStyle: "short"})
+    : "—";
+  const nextFeed = device.schedules_paused ? null : nextMealLabel(device.feeding_plans);
+  return {lastFed, nextFeed: nextFeed || "—"};
+}
+
+function buildFeedTimingStats(device) {
+  const {lastFed, nextFeed} = feedTimingValues(device);
+  return `<div class="detail-stats" style="margin-bottom:12px">
+    <div class="detail-stat" style="padding:8px 14px">
+      <div class="detail-stat-label">${t("card.last_fed")}</div>
+      <div class="detail-stat-value" id="detail-last-fed">${escHtml(lastFed)}</div>
+    </div>
+    <div class="detail-stat" style="padding:8px 14px">
+      <div class="detail-stat-label">${t("overview.next_feed")}</div>
+      <div class="detail-stat-value" id="detail-next-feed">${escHtml(nextFeed)}</div>
+    </div>
+  </div>`;
+}
+
 function buildOverviewTab(device) {
   const filterDays = filterDaysRemaining(device);
   const filterClass = filterDays != null && filterDays <= 3 ? "danger" : "accent";
@@ -385,6 +420,7 @@ function buildOverviewTab(device) {
     </div>
     <div style="margin-top:16px">
       <div class="tab-section-heading">${t("overview.controls")}</div>
+      ${buildFeedTimingStats(device)}
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <label style="white-space:nowrap;font-size:13px;color:var(--pl-subtext)">${t("overview.portions")}</label>
         <select class="form-input" id="feeder-portions" style="width:110px">
@@ -492,6 +528,7 @@ function buildOverviewTab(device) {
     </div>
     <div style="margin-top:16px">
       <div class="tab-section-heading">${t("overview.controls")}</div>
+      ${buildFeedTimingStats(device)}
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <label style="white-space:nowrap;font-size:13px;color:var(--pl-subtext)">${t("overview.portions")}</label>
         <select class="form-input" id="feeder-portions" style="width:110px">
@@ -504,18 +541,16 @@ function buildOverviewTab(device) {
         <button class="btn-primary" id="btn-feed-now" style="flex:1">${t("overview.feed_now")}</button>
       </div>
     </div>
-    <div class="toggle-list" style="margin-top:16px">
+    ${device.device_type !== "camera_feeder" ? `<div class="toggle-list" style="margin-top:16px">
       <div class="toggle-row">
         <span class="toggle-label">${t("overview.light")}</span>
         <button class="toggle-switch ${lightOn ? "sw-on" : "sw-off"}" id="ctrl-granary-light"></button>
       </div>
-      ${device.device_type !== "camera_feeder" ? `
       <div class="toggle-row">
         <span class="toggle-label">${t("overview.buttons_lock")}</span>
         <button class="toggle-switch ${lockOn ? "sw-on" : "sw-off"}" id="ctrl-granary-lock"></button>
       </div>
-      ` : ''}
-    </div>
+    </div>` : ""}
     ${device.device_type === "camera_feeder" ? buildCameraSettingsTab(device, "overview") : ""}`;
   }
 

@@ -1145,35 +1145,27 @@ _INGRESS_NETWORK = ipaddress.ip_network("172.30.32.0/23")
 
 
 @web.middleware
-async def _restrict_api_middleware(request, handler):
-    """Security: /api/* returns MQTT broker credentials (the edit forms need
-    to show/re-save them), so it must never be reachable from outside this
-    container. Confirmed via live diagnostic logging (2026-09-15) that Home
-    Assistant Supervisor's ingress proxy reaches this add-on from 172.30.32.2,
-    the standard internal Supervisor address, same as any other add-on --
-    host_network: true only affects what this add-on's own listening port is
-    exposed to, not how Supervisor's ingress proxy reaches it. An earlier
-    version of this check assumed loopback instead and broke the real UI,
-    corrected after checking real log data rather than guessing again.
-    Anything outside 172.30.32.0/23 hitting /api/* is coming from the LAN,
-    not through ingress, and gets rejected. /audio and /images stay open on
-    purpose, the feeder itself fetches those directly over plain HTTP,
-    unauthenticated, by design.
+async def _restrict_ingress_middleware(request, handler):
+    """Only Home Assistant ingress may access the UI and internal API.
+
+    Supervisor's ingress proxy reaches this host-network add-on from
+    172.30.32.0/23. Feeders fetch custom sounds and images directly over the
+    LAN, so those two resource paths remain publicly accessible.
     """
-    if request.path.startswith("/api/"):
+    if not request.path.startswith(("/audio/", "/images/")):
         try:
             remote_ip = ipaddress.ip_address(request.remote)
         except (ValueError, TypeError):
             remote_ip = None
         if remote_ip is None or remote_ip not in _INGRESS_NETWORK:
-            _LOGGER.warning("Blocked /api/* request from outside the internal network: %s %s",
+            _LOGGER.warning("Blocked non-ingress request: %s %s",
                             request.remote, request.path)
             return web.Response(status=403, text="Forbidden")
     return await handler(request)
 
 
 def main():
-    app = web.Application(middlewares=[_restrict_api_middleware])
+    app = web.Application(middlewares=[_restrict_ingress_middleware])
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 

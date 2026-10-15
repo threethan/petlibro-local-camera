@@ -273,12 +273,11 @@
     display: none;
     position: fixed;
     bottom: calc(var(--pl-tab-h) + 12px);
-    left: 50%;
+    right: 16px;
     z-index: 200;
     flex-direction: column;
     gap: 8px;
     align-items: center;
-    transform: translateX(-50%);
   }
   @media (max-width: 599px) { .fab-group { display: flex; } }
   @media (max-width: 599px) { #btn-bell { display: none !important; } }
@@ -905,6 +904,10 @@
   .camera-volume-control input[type="range"]::-moz-range-track { border: 0; }
   .camera-sound-controls { flex-wrap: wrap; }
   .camera-sound-controls .small-toggle-row { order: -1; width: 100%; margin: 0 0 8px; white-space: nowrap; }
+  .camera-schedule-controls { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; }
+  .camera-schedule-controls .small-toggle-row { order: 0; width: auto; margin: 0; white-space: normal; }
+  .camera-schedule-controls .small-toggle-row:last-child { justify-self: end; text-align: right; }
+  .camera-schedule-controls .small-toggle { flex-shrink: 0; }
   .small-toggle-row { display: flex; align-items: center; gap: 8px; width: fit-content; margin: 8px 0; font-size: 13px; color: var(--pl-subtext); }
   .small-toggle { appearance: none; width: 32px; height: 18px; border: 0; border-radius: 10px; background: var(--pl-border); position: relative; cursor: pointer; transition: background .2s; }
   .small-toggle::after { content: ''; position: absolute; width: 14px; height: 14px; top: 2px; left: 2px; border-radius: 50%; background: #fff; transition: transform .2s; }
