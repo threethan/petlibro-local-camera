@@ -3,15 +3,16 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-function render(device) {
+function render(device, category = "sensors") {
   const scope = vm.createContext({
     t: key => key,
     escHtml: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
     _utcToLocal: value => value,
     device,
+    category,
   });
   vm.runInContext(readFileSync(new URL('../addon/app/modal-device.js', import.meta.url), 'utf8'), scope);
-  return vm.runInContext('buildCameraSettingsTab(device, "sensors")', scope);
+  return vm.runInContext('buildCameraSettingsTab(device, category)', scope);
 }
 
 test('camera settings expose recording modes, hours and feeding clip parameters', () => {
@@ -40,7 +41,7 @@ test('SD card facts stay read-only and escaped', () => {
 
 test('indicator light settings display scheduled hours from UTC reports', () => {
   const html = render({lightSwitch: true, lightAgingType: 2,
-    lightingStartTimeUtc: '08:00', lightingEndTimeUtc: '22:00'});
+    lightingStartTimeUtc: '08:00', lightingEndTimeUtc: '22:00'}, "indicators");
   for (const key of ['lightSwitch', 'lightAgingType', 'lightingStartTime', 'lightingEndTime']) {
     assert.ok(html.includes(`data-camera-setting="${key}"`), key);
   }

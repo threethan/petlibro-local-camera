@@ -324,6 +324,8 @@ function renderSettings() {
     }
   }
   const cameraIntervalEl = document.getElementById("s-camera-snapshot-interval");
+  const snapshotEnabledEl = document.getElementById("s-camera-snapshot-enabled");
+  if (snapshotEnabledEl) snapshotEnabledEl.checked = _settings.camera_snapshot_enabled === true;
   if (cameraIntervalEl) {
     cameraIntervalEl.value = _settings.camera_snapshot_interval_secs ?? 15;
   }
@@ -357,6 +359,7 @@ async function saveSettings(fromTab) {
     notify_mobile_default_service: document.getElementById("s-notify-mobile-service")?.value || "",
     local_audio_base_url: (document.getElementById("s-local-audio-base-url")?.value || "").trim(),
     camera_snapshot_interval_secs: Number(cameraIntervalEl?.value || 15),
+    camera_snapshot_enabled: document.getElementById("s-camera-snapshot-enabled")?.checked === true,
     camera_vp8_transcoding: document.getElementById("s-camera-vp8-transcoding")?.checked === true,
   };
   const statusEl = document.getElementById("mqtt-status");

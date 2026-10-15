@@ -13,22 +13,29 @@ function switchTab(name) {
 }
 
 // ── Refresh ───────────────────────────────────────────────────────────────
+function renderDeviceUpdates() {
+  renderDevices();
+  checkAlerts();
+  if (_currentDevice) {
+    const device = _devices.find(d => d.serial === _currentDevice.serial);
+    if (device) updateDeviceModalStatus(device);
+  }
+}
+
 async function refresh() {
   _lastDeviceRenderKey = "";
   _lastPetRenderKey = "";
   await loadAll();
-  renderDevices();
+  renderDeviceUpdates();
   renderPets();
   renderSettings();
-  checkAlerts();
   checkPetSetup();
 }
 
 async function pollRefresh() {
   await loadAll();
-  renderDevices();
+  renderDeviceUpdates();
   renderPets();
-  checkAlerts();
   // Never re-render settings while user may be typing
 }
 
@@ -38,17 +45,7 @@ async function pingVisibleDevices() {
   _devicePingInFlight = true;
   try {
     _devices = await api("POST", "/api/devices/ping");
-    renderDevices();
-    checkAlerts();
-    if (_currentDevice) {
-      const device = _devices.find(d => d.serial === _currentDevice.serial);
-      if (device) {
-        _currentDevice = device;
-        const badge = document.getElementById("detail-status-badge");
-        badge.textContent = device.online ? t("device.online") : t("device.offline");
-        badge.className = `status-badge ${device.online ? "online" : "offline"}`;
-      }
-    }
+    renderDeviceUpdates();
   } catch (error) {
     console.error("Device ping failed", error);
   } finally {

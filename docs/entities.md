@@ -62,7 +62,7 @@ The Smart Camera Feeder exposes the Granary entities except Buttons Lock; its co
 | Next Meal | Sensor (diagnostic) | Timestamp of the next enabled scheduled feeding |
 | Desiccant Days Remaining | Sensor (diagnostic) | Days until desiccant replacement is due |
 
-The PLAF203 Smart Camera Feeder creates a snapshot **Camera** entity that receives a fresh JPEG about every five seconds while both `cameraSwitch` and `enableCamera` are on. In the web UI's Camera tab, enable **Live Camera in Home Assistant** to add a separate stream-capable camera entity; turn it off to remove that entity. The Petlibro Local - Live Camera Bridge custom integration must be installed and added to Home Assistant once. The toggle controls a go2rtc RTSP source reachable from Home Assistant's Supervisor network.
+The PLAF203 Smart Camera Feeder creates a snapshot **Camera** entity that receives a fresh JPEG at the configured interval while snapshot capture is enabled in Settings and the feeder reports both `cameraSwitch` and `enableCamera` as on. In the web UI's Camera tab, enable **Live Camera in Home Assistant** to add a separate stream-capable camera entity; turn it off to remove that entity. The Petlibro Local - Live Camera Bridge custom integration must be installed and added to Home Assistant once. The toggle controls a go2rtc RTSP source reachable from Home Assistant's Supervisor network.
 
 ## Fountains (Dockstream 2 and the other fountain models)
 

@@ -38,8 +38,7 @@ function releaseCameraPower(serial, owner) {
   _cameraPowerOwners.delete(serial);
   setLiveCameraPower(serial, false).catch(() => {});
 }
-function stopLiveCamera(stopTalk = true) {
-  if (stopTalk) stopCameraTalk();
+function stopLiveCamera() {
   _liveCameraGeneration++;
   const powerOwner = _liveCameraPowerOwner;
   _liveCameraPowerOwner = null;
@@ -152,6 +151,20 @@ function openDeviceModal(device) {
   document.getElementById("modal-device").classList.add("open");
 }
 
+function updateDeviceModalStatus(device) {
+  if (!_currentDevice || _currentDevice.serial !== device.serial) return;
+
+  const wasOnline = _currentDevice.online;
+  _currentDevice = device;
+  const badge = document.getElementById("detail-status-badge");
+  badge.textContent = device.online ? t("device.online") : t("device.offline");
+  badge.className = `status-badge ${device.online ? "online" : "offline"}`;
+
+  if (wasOnline === device.online) return;
+  if (!device.online) stopLiveCamera();
+  renderDeviceTab(device.online ? "overview" : "offline");
+}
+
 function renderDeviceTab(tabName) {
   // Accept former internal keys used by cached markup or older integrations.
   if (["device-settings", "options", "camera-motion", "camera-video"].includes(tabName)) tabName = "sensors";
@@ -163,7 +176,6 @@ function renderDeviceTab(tabName) {
     return;
   }
   document.getElementById("device-tabs").style.display = "";
-  if (tabName !== "overview" || _currentDevice.device_type !== "camera_feeder") stopCameraTalk();
   _currentDeviceTab = tabName;
   const content = document.getElementById("dtab-content");
   if (tabName === "overview") content.innerHTML = buildOverviewTab(_currentDevice);
@@ -270,15 +282,16 @@ function buildCameraSettingsTab(device, category = "all") {
       <div class="camera-settings-grid">${choice(t("settings.camera_resolution"), "resolution", device.resolution || "P1080", [["P1080","1080p"],["P720","720p"]])}${choice(t("settings.camera_night_vision"), "nightVision", device.nightVision || "OPEN", [["AUTOMATIC","Automatic"],["OPEN","Always on"],["CLOSE","Off"]])}</div>
       ${schedule("camera", "cameraAgingType", device.cameraAgingType, "cameraStartTime", device.camera_start_local || "00:00", "cameraEndTime", device.camera_end_local || "23:59", "", `<label class="small-toggle-row"><span>PetLibro Watermark &amp; Time</span><input class="small-toggle" type="checkbox" data-camera-setting="videoWatermarkSwitch" ${device.videoWatermarkSwitch !== false ? "checked" : ""}></label>`)}
     `, { toggleHidden: powerWithLiveView, bodyOpen: powerWithLiveView, trailing: powerWithLiveViewControl + exposureControl }) : ""}
-    ${show("indicators") ? section("Indicator lights", "lightSwitch", device.lightSwitch !== false, `
-      ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
-      <p class="form-hint">Lights stay on all day with Schedule off. With Schedule on, choose the hours when indicator lights are enabled. Hours use the configured feeder timezone.</p>
-    `) : ""}
+    ${show("indicators") ? `<section class="camera-settings-section">
+      ${category === "overview" ? "" : `<header class="camera-settings-header"><h3>Indicator lights</h3><button type="button" class="toggle-switch ${device.lightSwitch !== false ? "sw-on" : "sw-off"}" data-camera-setting="lightSwitch" data-toggle="true" aria-label="Enable Indicator lights"></button></header>`}
+      <div class="camera-settings-body">
+        ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
+      </div>
+    </section>` : ""}
     ${show("recording") ? buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
       <p class="form-hint">The feeder saves video to its SD card. Motion recording also requires Motion Detection to be enabled with overlapping hours.</p>
       ${choice("Recording mode", "videoRecordMode", device.videoRecordMode || "CONTINUOUS", [["CONTINUOUS", "Continuous"], ["MOTION_DETECTION", "Motion detection"]])}
       ${schedule("recording", "videoRecordAgingType", device.videoRecordAgingType, "videoRecordStartTime", device.videoRecordStartTime || utcToLocalOrEmpty(device.videoRecordStartTimeUtc) || "00:00", "videoRecordEndTime", device.videoRecordEndTime || utcToLocalOrEmpty(device.videoRecordEndTimeUtc) || "23:59")}
-      <p class="form-hint">Hours use the configured feeder timezone. Overnight schedules are supported.</p>
     `) : ""}
     ${show("feeding-video") ? section("Feeding video", "feedingVideoSwitch", device.feedingVideoSwitch === true, `
       <label class="small-toggle-row"><span>Record scheduled feeding</span><input class="small-toggle" type="checkbox" data-camera-setting="enableVideoStartFeedingPlan" ${device.enableVideoStartFeedingPlan === true ? "checked" : ""}></label>
@@ -460,10 +473,6 @@ function buildOverviewTab(device) {
           <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
         </div>
         <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
-      </div>
-      <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
-        <button type="button" class="btn-secondary" id="camera-talk-toggle" aria-label="Talk" aria-pressed="false" aria-describedby="camera-talk-status"><span class="material-icons" aria-hidden="true">mic</span></button>
-        <span id="camera-talk-status" class="form-hint" role="status" aria-live="polite">Use your microphone to talk to the feeder.</span>
       </div>
     </section>` : "";
     return `${liveCameraHtml}<div class="detail-stats">
@@ -814,7 +823,6 @@ function buildMaintenanceTab(device) {
 async function _wireFeedSoundControls(device, selectEl) {
   const statusEl = document.getElementById("maint-audio-status");
   const pushBtn  = document.getElementById("btn-push-audio");
-  const repetitionsEl = document.getElementById("maint-audio-repetitions");
 
   async function refreshList() {
     try {
@@ -832,12 +840,10 @@ async function _wireFeedSoundControls(device, selectEl) {
     pushBtn.onclick = async () => {
       const name = selectEl.value;
       if (!name) { statusEl.textContent = t("maint.feed_sound_select_first"); return; }
-      const soundRepititions = Math.max(1, Math.min(5, Number(repetitionsEl?.value) || 1));
-      if (repetitionsEl) repetitionsEl.value = soundRepititions;
       pushBtn.disabled = true;
       statusEl.textContent = t("maint.pushing");
       try {
-        await api("POST", `/api/devices/${device.serial}/push-audio`, { name, soundRepititions });
+        await api("POST", `/api/devices/${device.serial}/push-audio`, { name });
         statusEl.textContent = t("maint.push_success");
       } catch(e) {
         statusEl.textContent = t("maint.push_failed", {error: e.message});
@@ -1179,10 +1185,6 @@ function buildScheduleTab(plans) {
         <select class="form-select" id="maint-audio-select">
           <option value="" data-i18n="maint.feed_sound_loading">${t("maint.feed_sound_loading")}</option>
         </select>
-      </div>
-      <div class="feed-sound-field">
-        <label class="form-label" for="maint-audio-repetitions">${t("maint.default_repititions")}</label>
-        <input class="form-input" id="maint-audio-repetitions" type="number" min="1" max="5" value="${_currentDevice.soundRepititions ?? 1}">
       </div>
       <div class="feed-sound-field">
         <span class="form-label" aria-hidden="true">&nbsp;</span>
@@ -1575,7 +1577,6 @@ function wireDeviceTabHandlers(tabName) {
     wireCameraExposureToggle(d);
   }
   if (tabName === "overview" && d.device_type === "camera_feeder") {
-    wireCameraTalk(d.serial);
     const frame = document.getElementById("camera-live-frame");
     const start = document.getElementById("camera-live-start");
     const status = document.getElementById("camera-live-status");
@@ -1615,7 +1616,6 @@ function wireDeviceTabHandlers(tabName) {
       sound.setAttribute("aria-label", sound.title);
     };
     if (sound) sound.onclick = () => {
-      if (_cameraTalk) return;
       const video = frame.querySelector("video");
       if (!video) return;
       video.muted = !video.muted;
@@ -1623,7 +1623,7 @@ function wireDeviceTabHandlers(tabName) {
       if (!video.muted) video.play().catch(() => {});
     };
     const stopCameraView = () => {
-      stopLiveCamera(false);
+      stopLiveCamera();
       frame?.querySelector("video")?.remove();
       if (sound) sound.hidden = true;
       if (placeholder) placeholder.style.display = "";
@@ -1636,7 +1636,7 @@ function wireDeviceTabHandlers(tabName) {
     if (stop) stop.onclick = stopCameraView;
     if (start && frame) start.onclick = async () => {
       // A Status rerender can replace the button while setup is still pending.
-      if (_liveCameraPc || _liveCameraPowerOwner) stopLiveCamera(false);
+      if (_liveCameraPc || _liveCameraPowerOwner) stopLiveCamera();
       const generation = ++_liveCameraGeneration;
       const current = () => generation === _liveCameraGeneration;
       const powerWithLiveView = d.camera_power_with_live_view === true;
@@ -1682,10 +1682,9 @@ function wireDeviceTabHandlers(tabName) {
           if (stop) stop.hidden = false;
           frame.classList.add("is-live");
           const vp8Hint = document.getElementById("camera-windows-vp8-hint");
-          if (vp8Hint) vp8Hint.hidden = _settings.camera_vp8_transcoding !== true;
+          if (vp8Hint) vp8Hint.hidden = _settings.camera_vp8_transcoding === true;
           if (sound) sound.hidden = false;
           setSoundState(video.muted);
-          muteCameraForTalk();
         };
         await pc.setLocalDescription(await pc.createOffer());
         await new Promise(resolve => {
@@ -1706,7 +1705,7 @@ function wireDeviceTabHandlers(tabName) {
         await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
       } catch (error) {
         if (!current()) return;
-        stopLiveCamera(false);
+        stopLiveCamera();
         frame.classList.remove("is-live");
         video.remove();
         if (placeholder) { placeholder.textContent = "Camera stream unavailable."; placeholder.style.display = ""; }

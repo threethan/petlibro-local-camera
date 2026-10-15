@@ -11,14 +11,10 @@ RUN git init /src \
 	&& git -C /src remote add origin https://github.com/aerodomigue/petlibro_granary_local_relay.git \
 	&& git -C /src fetch --depth 1 origin ${CAMERA_BRIDGE_REV} \
 	&& git -C /src checkout --detach FETCH_HEAD
-COPY camera-bridge-sps-pps.patch /tmp/camera-bridge-sps-pps.patch
-RUN git -C /src apply --check /tmp/camera-bridge-sps-pps.patch \
-	&& git -C /src apply /tmp/camera-bridge-sps-pps.patch
+COPY camera-bridge-audio.patch /tmp/camera-bridge-audio.patch
+RUN git -C /src apply --check /tmp/camera-bridge-audio.patch \
+    && git -C /src apply /tmp/camera-bridge-audio.patch
 WORKDIR /src/camera-bridge
-COPY camera-bridge-talkback.patch /tmp/camera-bridge-talkback.patch
-RUN git -C /src apply --check /tmp/camera-bridge-talkback.patch \
-	&& git -C /src apply /tmp/camera-bridge-talkback.patch
-COPY camera-talkback/ /src/camera-bridge/
 RUN go test ./... \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath -ldflags="-s -w" -o /petlibro-camera-bridge ./cmd/petlibro-camera-bridge
@@ -31,6 +27,7 @@ RUN apk add --no-cache ffmpeg
 RUN pip3 install --no-cache-dir aiohttp aiomqtt tzdata
 
 COPY app/ /app/
+RUN rm /app/camera_talk.py /app/camera-talk.js /app/camera-talk-worklet.js
 COPY icon.png /app/icon.png
 COPY --from=camera-bridge-build /petlibro-camera-bridge /usr/local/bin/petlibro-camera-bridge
 COPY --from=go2rtc /usr/local/bin/go2rtc /usr/local/bin/go2rtc

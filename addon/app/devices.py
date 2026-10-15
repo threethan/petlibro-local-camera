@@ -50,6 +50,14 @@ _SD_CARD_FIELDS = frozenset({"enableVideoRecord", "sdCardState", "sdCardFileSyst
 _INDICATOR_TIME_FIELDS = frozenset({"lightingStartTime", "lightingEndTime",
                                     "lightingStartTimeUtc", "lightingEndTimeUtc"})
 _INDICATOR_FIELDS = _INDICATOR_TIME_FIELDS | {"lightSwitch", "lightAgingType"}
+_CAMERA_FEEDER_SCHEDULE_SWITCHES = (
+    ("cameraSwitch", "cameraAgingType"),
+    ("lightSwitch", "lightAgingType"),
+    ("soundSwitch", "soundAgingType"),
+    ("videoRecordSwitch", "videoRecordAgingType"),
+    ("motionDetectionSwitch", "motionDetectionAgingType"),
+    ("soundDetectionSwitch", "soundDetectionAgingType"),
+)
 UI_PING_TIMEOUT_SECS = 5
 
 OFFLINE_ALERT_DELAY_SECS = 90
@@ -408,8 +416,21 @@ def _event_sub_topic(device_type: str, serial: str) -> str:
 
 # ── Commands ───────────────────────────────────────────────────────────────
 
+def _with_enabled_schedule_modes(serial: str, payload: dict) -> dict:
+    """Give an enabled camera-feeder feature a valid all-day schedule if needed."""
+    if _devices.get(serial, (None, None))[1] != "camera_feeder":
+        return payload
+    state = _state.get(serial, {})
+    result = payload
+    for switch, aging in _CAMERA_FEEDER_SCHEDULE_SWITCHES:
+        if payload.get(switch) is True and payload.get(aging, state.get(aging)) not in (1, 2):
+            result = {**result, aging: 1}
+    return result
+
+
 async def _ping_device(serial: str) -> None:
     """Require a fresh device reply, rather than a successful broker publish."""
+    last_seen = _last_seen.get(serial)
     msg_id = uuid.uuid4().hex
     key = (serial, msg_id)
     reply = asyncio.get_running_loop().create_future()
@@ -422,7 +443,9 @@ async def _ping_device(serial: str) -> None:
 
         await asyncio.wait_for(exchange(), timeout=UI_PING_TIMEOUT_SECS)
     except (asyncio.TimeoutError, RuntimeError):
-        if serial in _devices:
+        # A reconnect or spontaneous report during this probe is newer
+        # evidence of connectivity, even if its msgId does not match ours.
+        if serial in _devices and _last_seen.get(serial) == last_seen:
             _mark_offline(serial)
             asyncio.ensure_future(_check_and_fire_alerts(serial))
     finally:
@@ -457,6 +480,9 @@ async def send_command(serial: str, payload: dict) -> bool:
     if _client_ref is None:
         _LOGGER.warning("send_command: no MQTT client")
         return False
+    # A switch can be on while its aging type is 0 (invalid), leaving the
+    # corresponding runtime enable flag off.
+    payload = _with_enabled_schedule_modes(serial, payload)
     envelope = {
         "cmd":   "ATTR_SET_SERVICE",
         "ts":    int(time.time() * 1000),
@@ -1052,6 +1078,9 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
             ok = await send_display_frame(serial, frame)
             _LOGGER.info("Custom frame sent to %s...: %s", serial[:6], "ok" if ok else "failed")
     elif "_granary_field" in cmd:
+        if device_type == "camera_feeder" and cmd["_granary_field"] == "lightSwitch":
+            await _send_camera_settings(serial, {"lightSwitch": cmd["_granary_value"]})
+            return
         bundle = _granary_settings_bundle(serial, {cmd["_granary_field"]: cmd["_granary_value"]})
         ok = await send_command(serial, bundle)
         _LOGGER.info("HA Granary %s %s...: %s", cmd["_granary_field"], serial[:6], "ok" if ok else "failed")
@@ -1185,6 +1214,10 @@ async def handle_ha_command(serial: str, cmd: dict) -> None:
         if not ok:
             raise RuntimeError("display switch was not sent")
     elif "_granary_field" in cmd:
+        if (_devices.get(serial, (None, None))[1] == "camera_feeder" and
+                cmd["_granary_field"] == "lightSwitch"):
+            await _send_camera_settings(serial, {"lightSwitch": cmd["_granary_value"]})
+            return
         bundle = _granary_settings_bundle(serial, {cmd["_granary_field"]: cmd["_granary_value"]})
         ok = await send_command(serial, bundle)
         _LOGGER.info("API Granary %s %s...: %s", cmd["_granary_field"], serial[:6], "ok" if ok else "failed")
@@ -1205,7 +1238,7 @@ async def _send_camera_settings(serial: str, updates: dict) -> None:
         raise RuntimeError("A camera settings change is already awaiting acknowledgement")
     if set(updates) - (_RECORDING_FIELDS | _INDICATOR_FIELDS):
         raise ValueError("Unsupported camera settings")
-    payload = dict(updates)
+    payload = _with_enabled_schedule_modes(serial, dict(updates))
     for key, value in payload.items():
         if key in _RECORDING_BOOL_FIELDS | {"lightSwitch"} and type(value) is not bool:
             raise ValueError(f"{key} must be a boolean")
@@ -1220,13 +1253,21 @@ async def _send_camera_settings(serial: str, updates: dict) -> None:
         if aging_key in payload and (type(payload[aging_key]) is not int or payload[aging_key] not in (1, 2)):
             raise ValueError("Schedule must be all day or custom")
     state = _state.get(serial, {})
+    if "lightSwitch" in payload:
+        # PLAF203 firmware 3.0.30 ACKs a toggle without lighting hours, then
+        # drops MQTT/Wi-Fi. The old Granary bundle does this too. Include the
+        # same schedule context that works for schedule edits, in both directions.
+        aging = state.get("lightAgingType", 1)
+        payload.setdefault("lightAgingType", aging if aging in (1, 2) else 1)
     for prefix, aging_key, switch_key in (("videoRecord", "videoRecordAgingType", "videoRecordSwitch"),
                                            ("lighting", "lightAgingType", "lightSwitch")):
-        touched = bool(set(payload) & (_INDICATOR_FIELDS if prefix == "lighting" else
-                                       {key for key in _RECORDING_FIELDS if key.startswith("videoRecord")}))
+        schedule_fields = (_INDICATOR_TIME_FIELDS | {aging_key}) if prefix == "lighting" else {
+            key for key in _RECORDING_FIELDS if key.startswith("videoRecord")
+        }
+        touched = bool(set(payload) & schedule_fields)
         if not touched:
             continue
-        required = (payload.get(switch_key) is not False and
+        required = ((prefix == "lighting" or payload.get(switch_key) is not False) and
                     payload.get(aging_key, state.get(aging_key)) == 2)
         # Indicator schedules retain their hours when switching back to all day.
         if not required and prefix != "lighting":
@@ -1243,6 +1284,10 @@ async def _send_camera_settings(serial: str, updates: dict) -> None:
             if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
                 if required:
                     raise ValueError("Custom schedule requires start and end times")
+                if prefix == "lighting" and "lightSwitch" in payload:
+                    # All-day mode may never have reported hours. These are
+                    # the editor's defaults; custom schedules must retain theirs.
+                    payload[key] = "00:00" if key.endswith("StartTime") else "23:59"
                 continue
             payload[key] = value
     for key in ("videoRecordStartTime", "videoRecordEndTime", "lightingStartTime", "lightingEndTime"):

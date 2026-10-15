@@ -13,7 +13,6 @@ import uuid
 from aiohttp import web
 
 import camera
-import camera_talk
 import devices
 import ha_api
 import mosquitto
@@ -662,9 +661,13 @@ async def handle_api_local_audio_url_suggestion(request):
 async def handle_api_settings_post(request):
     try:
         data = await request.json()
+        previous_vp8_transcoding = storage.get_settings().get("camera_vp8_transcoding", False)
         result = storage.save_settings(data)
         settings = storage.get_settings()
         await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
+        await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"])
+        if settings["camera_vp8_transcoding"] != previous_vp8_transcoding:
+            await camera.refresh_live_exposures()
         devices.configure(
             settings["mqtt_host"],
             settings["mqtt_port"],
@@ -1097,6 +1100,7 @@ async def on_startup(app):
         _LOGGER.warning("PLAF203 camera support is unavailable until the bridge starts")
     settings = storage.get_settings()
     await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
+    await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"])
     devices.configure(
         settings["mqtt_host"],
         settings["mqtt_port"],
@@ -1116,6 +1120,8 @@ async def on_startup(app):
             camera_uid = cached_state.get("camera_uid")
             if isinstance(camera_uid, str) and camera_uid:
                 enabled = bool(cached_state.get("cameraSwitch", cached_state.get("enableCamera", False)))
+                if "enableCamera" in cached_state:
+                    enabled = enabled and bool(cached_state["enableCamera"])
                 asyncio.create_task(camera.update_device(serial, camera_uid, enabled))
     devices.suppress_alerts(True)
     await devices.start()
@@ -1166,7 +1172,6 @@ async def _restrict_api_middleware(request, handler):
 def main():
     app = web.Application(middlewares=[_restrict_api_middleware])
     app.on_startup.append(on_startup)
-    app.on_shutdown.append(camera_talk.on_shutdown)
     app.on_cleanup.append(on_cleanup)
 
     app.router.add_get("/",                              handle_index)
@@ -1180,7 +1185,6 @@ def main():
     app.router.add_get("/api/devices",                   handle_api_devices_get)
     app.router.add_post("/api/devices/ping",             handle_api_devices_ping)
     app.router.add_get("/api/devices/{serial}/camera/live", handle_api_camera_live)
-    app.router.add_get("/api/devices/{serial}/camera/talk", camera_talk.handle_talk)
     app.router.add_post("/api/devices/{serial}/camera/webrtc", handle_api_camera_webrtc)
     app.router.add_delete("/api/devices/{serial}/camera/webrtc/{session_id}", handle_api_camera_webrtc_close)
     app.router.add_post("/api/devices/{serial}/camera/exposure", handle_api_camera_live_exposure)

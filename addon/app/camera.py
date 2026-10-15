@@ -17,6 +17,7 @@ _HA_RTSP_HOST = "172.30.32.1"
 _HA_RTSP_PORT = 18556
 _GO2RTC_WEBRTC = f"{_GO2RTC_API}/api/webrtc?src={{serial}}"
 _SNAPSHOT_INTERVAL_SECS = 5
+_SNAPSHOTS_ENABLED = False
 _STREAM_READ_TIMEOUT_SECS = 25
 _MAX_JPEG_BYTES = 2 * 1024 * 1024
 _SERIAL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -45,6 +46,19 @@ def live_stream_available(serial: str) -> bool:
         and _bridge_process.returncode is None
         and _live_serial is None
     )
+
+
+def _vp8_transcode_source(raw_source: str) -> str:
+    """Use go2rtc's FFmpeg templates to publish a VP8 RTSP producer."""
+    return f"ffmpeg:{raw_source}#input=vp8input#video=vp8"
+
+
+def _live_stream_sources(serial: str, vp8_enabled: bool) -> list[str]:
+    stream_name = f"plaf203_{serial}"
+    raw_source = _RTSP_URL.format(serial=serial)
+    sources = [_vp8_transcode_source(raw_source)] if vp8_enabled else []
+    sources.extend((raw_source, f"ffmpeg:{stream_name}#audio=opus"))
+    return sources
 
 
 async def live_frames(serial: str):
@@ -231,11 +245,11 @@ async def exchange_webrtc(serial: str, offer: bytes) -> tuple[bytes, str | None]
     import storage
 
     settings = storage.get_settings()
-    raw_source = _RTSP_URL.format(serial=serial)
-    sources = [raw_source]
-    if settings.get("camera_vp8_transcoding", False):
-        sources.append(f"exec:ffmpeg -flags low_delay -timeout {{timeout}} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -analyzeduration 1000000 -probesize 1000000 -i {raw_source} -r 15 -fps_mode cfr -c:v libvpx -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 15 -keyint_min 15 -b:v 1200k -pix_fmt yuv420p -an -user_agent ffmpeg/go2rtc -rtsp_transport tcp -f rtsp {{output}}")
-    sources.append(f"ffmpeg:{stream_name}#audio=opus")
+    # go2rtc picks the first source compatible with the browser's offered
+    # codecs. Put VP8 first so enabling the setting actually selects it.
+    sources = _live_stream_sources(
+        serial, settings.get("camera_vp8_transcoding", False) is True,
+    )
     params = [("name", stream_name)]
     params.extend(("src", source) for source in sources)
     async with _http.put(
@@ -275,11 +289,12 @@ async def set_live_exposure(serial: str, enabled: bool, config: dict, state: dic
             raise RuntimeError("Feeder camera is not online or enabled")
         if serial in _live_exposed:
             return
-        raw_source = _RTSP_URL.format(serial=serial)
-        sources = [raw_source]
-        if __import__("storage").get_settings().get("camera_vp8_transcoding", False):
-            sources.append(f"exec:ffmpeg -flags low_delay -timeout {{timeout}} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -analyzeduration 1000000 -probesize 1000000 -i {raw_source} -r 15 -fps_mode cfr -c:v libvpx -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -error-resilient 1 -g 15 -keyint_min 15 -b:v 1200k -pix_fmt yuv420p -an -user_agent ffmpeg/go2rtc -rtsp_transport tcp -f rtsp {{output}}")
-        sources.append(f"ffmpeg:{stream_name}#audio=opus")
+        sources = _live_stream_sources(
+            serial,
+            __import__("storage").get_settings().get("camera_vp8_transcoding", False) is True,
+        )
+        # Keep transcoded VP8 first; otherwise the earlier H.264 producer
+        # wins before go2rtc gets a chance to consider the VP8 track.
         params = [("name", stream_name)]
         params.extend(("src", source) for source in sources)
         async with _http.put(
@@ -318,6 +333,30 @@ async def set_live_exposure(serial: str, enabled: bool, config: dict, state: dic
             _LOGGER.warning("Could not remove go2rtc stream for %s... (HTTP %d)", serial[:6], response.status)
 
 
+async def refresh_live_exposures() -> None:
+    """Re-register exposed streams after changing the transcoding setting."""
+    if _http is None or _http.closed or not _live_exposed:
+        return
+    import storage
+
+    enabled = storage.get_settings().get("camera_vp8_transcoding", False) is True
+    for serial in tuple(_live_exposed):
+        stream_name = f"plaf203_{serial}"
+        params = [("name", stream_name)]
+        params.extend(("src", source) for source in _live_stream_sources(serial, enabled))
+        try:
+            async with _http.put(
+                f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
+            ) as response:
+                if response.status >= 400:
+                    _LOGGER.warning(
+                        "Could not refresh live camera stream for %s... (HTTP %d): %s",
+                        serial[:6], response.status, (await response.text())[:300],
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            _LOGGER.warning("Could not refresh live camera stream for %s...", serial[:6], exc_info=True)
+
+
 async def close_webrtc(session_id: str) -> None:
     location = _webrtc_sessions.pop(session_id, None)
     if location and _http and not _http.closed:
@@ -332,8 +371,6 @@ async def close_webrtc(session_id: str) -> None:
 async def stop_bridge() -> None:
     """Stop snapshot tasks and the bridge during add-on shutdown."""
     global _http, _bridge_process, _go2rtc_process
-    import camera_talk
-    await camera_talk.stop_all()
     for serial in list(_tasks):
         await stop_device(serial)
     _registered_uids.clear()
@@ -361,7 +398,7 @@ async def stop_bridge() -> None:
 
 
 async def update_device(serial: str, uid: str, enabled: bool) -> None:
-    """Register a camera UID without opening a background RTSP session."""
+    """Register a camera UID and start or stop its snapshot loop."""
     if not _SERIAL_RE.fullmatch(serial) or not _UID_RE.fullmatch(uid):
         _LOGGER.warning("Ignoring invalid PLAF203 camera identity for %s...", serial[:6])
         return
@@ -394,10 +431,14 @@ async def update_device(serial: str, uid: str, enabled: bool) -> None:
         except Exception:
             _LOGGER.exception("Could not restore HA live camera exposure for %s...", serial[:6])
 
-    # Do not start an FFmpeg snapshot process merely because the feeder has
-    # its camera enabled.  PLAF203 can stop accepting MQTT control commands
-    # while repeated RTSP login/reconnect attempts are active.  Snapshot/live
-    # consumers must create their own session on demand.
+    if not _SNAPSHOTS_ENABLED:
+        await _set_available(serial, False)
+        return
+
+    task = _tasks.get(serial)
+    if task is None or task.done():
+        _LOGGER.info("Starting HA camera snapshots for %s...", serial[:6])
+        _tasks[serial] = asyncio.create_task(_snapshot_loop(serial), name=f"camera-{serial}")
 
 
 async def set_snapshot_interval(seconds: int) -> None:
@@ -431,9 +472,34 @@ async def set_snapshot_interval(seconds: int) -> None:
     _LOGGER.info("Camera snapshot interval set to %d seconds", seconds)
 
 
+async def set_snapshots_enabled(enabled: bool) -> None:
+    """Start snapshot capture only after the user explicitly enables it."""
+    global _SNAPSHOTS_ENABLED
+    if not isinstance(enabled, bool):
+        raise ValueError("Camera snapshot enabled must be a boolean")
+    if enabled == _SNAPSHOTS_ENABLED:
+        return
+    _SNAPSHOTS_ENABLED = enabled
+    if not enabled:
+        serials = list(_tasks)
+        tasks = [_tasks.pop(serial) for serial in serials]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for serial in serials:
+            await _set_available(serial, False)
+        return
+    for serial in list(_registered_uids):
+        task = _tasks.get(serial)
+        if task is None or task.done():
+            _tasks[serial] = asyncio.create_task(
+                _snapshot_loop(serial), name=f"camera-{serial}"
+            )
+            _LOGGER.info("Starting HA camera snapshots for %s...", serial[:6])
+
+
 async def stop_device(serial: str) -> None:
-    import camera_talk
-    await camera_talk.stop_device(serial)
     if _live_serial == serial and _live_process and _live_process.returncode is None:
         _live_process.kill()
     task = _tasks.pop(serial, None)

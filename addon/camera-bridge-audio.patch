@@ -1,0 +1,86 @@
+diff --git a/camera-bridge/internal/bridge/media.go b/camera-bridge/internal/bridge/media.go
+--- a/camera-bridge/internal/bridge/media.go
++++ b/camera-bridge/internal/bridge/media.go
+@@ -154,6 +154,7 @@ func newMediaPublisher() *mediaPublisher {
+ 	if audioCodec == nil {
+ 		panic("confirmed PLAF203 AAC ADTS header is invalid")
+ 	}
++	audioCodec.PayloadType = core.PayloadTypeRAW
+ 	audioMedia := &core.Media{
+ 		Kind:      core.KindAudio,
+ 		Direction: core.DirectionRecvonly,
+diff --git a/camera-bridge/internal/plaf203/bootstrap.go b/camera-bridge/internal/plaf203/bootstrap.go
+--- a/camera-bridge/internal/plaf203/bootstrap.go
++++ b/camera-bridge/internal/plaf203/bootstrap.go
+@@ -154,6 +154,23 @@ func (session *Session) sendControl(channel uint16, index uint32, controlType ui
+ 	return nil
+ }
+ 
++// sendRuntimeControl advances the IOCtrl index established by the three
++// bootstrap commands. Reusing index zero makes the feeder discard AUDIOSTART
++// as a duplicate of SET_STREAM_CTRL even though the command counter changes.
++func (session *Session) sendRuntimeControl(controlType uint32) error {
++	payload := make([]byte, 4+audioControlArgumentSize)
++	binary.LittleEndian.PutUint32(payload, controlType)
++	session.sendMu.Lock()
++	defer session.sendMu.Unlock()
++	index := session.controlIndex
++	session.controlIndex++
++	body := encodeControlData(session.session25.nextOutboundCommand(), controlChannelSystem, index, payload)
++	if err := session.sendBodyLocked(body); err != nil {
++		return fmt.Errorf("send PLAF203 runtime control type=0x%04x index=%d: %w", controlType, index, err)
++	}
++	return nil
++}
++
+ func (session *Session) waitForControlReplies(ctx context.Context, diagnostics *bootstrapDiagnostics) error {
+ 	replyContext, cancel := context.WithTimeout(ctx, bootstrapReplyTimeout)
+ 	defer cancel()
+diff --git a/camera-bridge/internal/plaf203/login.go b/camera-bridge/internal/plaf203/login.go
+--- a/camera-bridge/internal/plaf203/login.go
++++ b/camera-bridge/internal/plaf203/login.go
+@@ -77,6 +77,7 @@ type Session struct {
+ 	transport             DatagramTransport
+ 	clock                 func() time.Time
+ 	sequence              uint16
++	controlIndex          uint32
+ 	session25             session25State
+ 	media                 *MediaReceiver
+ 	observer              Observer
+@@ -138,7 +139,7 @@ func (session *Session) StartAudio() error {
+ 	if session.transport == nil || session.Address == nil {
+ 		return errors.New("PLAF203 audio transport is unavailable")
+ 	}
+-	if err := session.sendControl(controlChannelSystem, 0, controlStartAudio, make([]byte, audioControlArgumentSize)); err != nil {
++	if err := session.sendRuntimeControl(controlStartAudio); err != nil {
+ 		return fmt.Errorf("send PLAF203 AUDIOSTART: %w", err)
+ 	}
+ 	session.audioEnabled = true
+@@ -161,7 +162,7 @@ func (session *Session) StopAudio() error {
+ 		session.audioEnabled = false
+ 		return nil
+ 	}
+-	if err := session.sendControl(controlChannelSystem, 0, controlStopAudio, make([]byte, audioControlArgumentSize)); err != nil {
++	if err := session.sendRuntimeControl(controlStopAudio); err != nil {
+ 		return fmt.Errorf("send PLAF203 AUDIOSTOP: %w", err)
+ 	}
+ 	session.audioEnabled = false
+diff --git a/camera-bridge/internal/plaf203/session.go b/camera-bridge/internal/plaf203/session.go
+--- a/camera-bridge/internal/plaf203/session.go
++++ b/camera-bridge/internal/plaf203/session.go
+@@ -202,10 +202,11 @@ func (connector *DirectConnector) connectWithTransport(ctx context.Context, uid
+ 			Address:   cloneUDPAddress(address),
+ 			transport: transport,
+ 			clock:     clock,
+-			sequence:  2,
+-			session25: newSession25State(),
+-			media:     NewMediaReceiver(),
+-			observer:  observe,
++			sequence:     2,
++			controlIndex: 3,
++			session25:    newSession25State(),
++			media:        NewMediaReceiver(),
++			observer:     observe,
+ 		}
+ 		emit(observe, Event{State: StateConnected, Address: address})
+ 		emit(observe, Event{State: StateBootstrapping, Address: address})

@@ -34,6 +34,7 @@ DEFAULT_SETTINGS = {
     "notify_mobile_default_service": "",
     "local_audio_base_url": "",
     "camera_snapshot_interval_secs": 15,
+    "camera_snapshot_enabled": False,
     "camera_vp8_transcoding": False,
     "camera_auto_start_live_view": False,
 }
@@ -184,6 +185,7 @@ def save_settings(updates: dict) -> dict:
                     )
             if key in {
                 "camera_vp8_transcoding",
+                "camera_snapshot_enabled",
                 "camera_auto_start_live_view",
                 "device_ping_enabled",
             }:

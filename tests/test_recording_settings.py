@@ -53,6 +53,18 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(devices._state["feeder"]["videoRecordSwitch"])
         self.assertFalse(devices._pending_recording_acks)
 
+    async def test_recording_switch_repairs_invalid_schedule_before_ack(self):
+        devices._state["feeder"] = {"videoRecordAgingType": 0}
+
+        async def publish(serial, payload):
+            self.assertEqual(payload["videoRecordAgingType"], 1)
+            self.reply(serial, payload)
+            return True
+
+        with patch.object(devices, "send_command", side_effect=publish):
+            await devices.handle_ha_command("feeder", {"videoRecordSwitch": True})
+        self.assertEqual(devices._state["feeder"]["videoRecordAgingType"], 1)
+
     async def test_invalid_parameters_never_publish(self):
         invalid = [{"sdCardState": 1}, {"enableVideoRecord": True},
                    {"videoRecordSwitch": "true"}, {"videoRecordMode": "EVENT"},
@@ -148,6 +160,63 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await devices.handle_ha_command("feeder", {"lightSwitch": True})
         self.assertNotIn("lightSwitch", devices._state.get("feeder", {}))
+
+    async def test_indicator_toggles_always_resend_schedule_context(self):
+        devices._state["feeder"] = {"lightAgingType": 2,
+            "lightingStartTimeUtc": "12:00", "lightingEndTimeUtc": "00:00"}
+
+        async def publish(serial, payload):
+            self.assertEqual(payload["lightAgingType"], 2)
+            self.assertEqual(payload["lightingStartTimeUtc"], "12:00")
+            self.assertEqual(payload["lightingEndTimeUtc"], "00:00")
+            self.assertEqual(payload["lightingTimes"], 720)
+            self.reply(serial, payload)
+            return True
+
+        def to_utc(value):
+            h, m = map(int, value.split(":"))
+            return f"{(h + 4) % 24:02d}:{m:02d}"
+
+        with patch.object(devices, "send_command", side_effect=publish) as send, \
+                patch.object(devices, "_local_hhmm_to_utc", side_effect=to_utc):
+            for enabled in (False, True):
+                await devices.handle_ha_command("feeder", {"lightSwitch": enabled})
+                payload = send.call_args.args[1]
+                self.assertIs(payload["lightSwitch"], enabled)
+                self.assertEqual(payload["lightingStartTime"], "08:00")
+                self.assertEqual(payload["lightingEndTime"], "20:00")
+
+    async def test_indicator_all_day_without_cached_hours_gets_valid_context(self):
+        async def publish(serial, payload):
+            self.assertEqual(payload["lightAgingType"], 1)
+            self.assertEqual(payload["lightingStartTimeUtc"], "00:00")
+            self.assertEqual(payload["lightingEndTimeUtc"], "23:59")
+            self.assertEqual(payload["lightingTimes"], 1439)
+            self.reply(serial, payload)
+            return True
+
+        with patch.object(devices, "send_command", side_effect=publish):
+            for enabled in (False, True):
+                await devices.handle_ha_command("feeder", {"lightSwitch": enabled})
+
+    async def test_indicator_custom_toggle_without_hours_never_publishes(self):
+        devices._state["feeder"] = {"lightAgingType": 2}
+        with patch.object(devices, "send_command", AsyncMock()) as send:
+            for enabled in (False, True):
+                with self.assertRaises(ValueError):
+                    await devices.handle_ha_command("feeder", {"lightSwitch": enabled})
+            send.assert_not_called()
+
+    async def test_legacy_api_and_ha_indicator_paths_use_safe_camera_settings(self):
+        command = {"_granary_field": "lightSwitch", "_granary_value": False}
+        with patch.object(devices, "_send_camera_settings", AsyncMock()) as safe, \
+                patch.object(devices, "send_command", AsyncMock()) as send, \
+                patch.object(devices.ha_mqtt, "parse_command", return_value=command):
+            await devices.handle_ha_command("feeder", command)
+            await devices._handle_ha_command("feeder", "light/command", "OFF")
+            self.assertEqual(safe.await_count, 2)
+            safe.assert_awaited_with("feeder", {"lightSwitch": False})
+            send.assert_not_called()
 
     async def test_fountain_light_commands_keep_existing_path(self):
         devices._devices["fountain"] = ("PLWF106", "dockstream2")

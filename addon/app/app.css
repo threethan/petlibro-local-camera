@@ -417,14 +417,13 @@
   .local-audio-url-controls { display: flex; align-items: center; gap: 8px; }
   .local-audio-url-controls .form-input { flex: 1; min-width: 0; }
   .local-audio-url-controls .btn-secondary { flex-shrink: 0; white-space: nowrap; }
-  .feed-sound-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, .55fr) minmax(0, 1fr); gap: 8px; align-items: end; }
+  .feed-sound-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, .55fr); gap: 8px; align-items: end; }
   .feed-sound-field { min-width: 0; }
   .feed-sound-field .form-label { min-height: 18px; }
   .feed-sound-field .form-input, .feed-sound-field .form-select, .feed-sound-field .btn-secondary { width: 100%; }
   .feed-sound-field .form-input { max-width: 100%; }
   @media (max-width: 480px) {
-    .feed-sound-controls { grid-template-columns: minmax(0, 1fr) minmax(90px, .55fr); }
-    .feed-sound-field:last-child { grid-column: 1 / -1; }
+    .feed-sound-controls { grid-template-columns: minmax(0, 1fr); }
   }
   .btn-primary {
     background: var(--pl-accent);

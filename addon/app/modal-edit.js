@@ -1,6 +1,5 @@
 // ── Edit device modal ─────────────────────────────────────────────────────
 function openEditDevice() {
-  stopCameraTalk();
   const device = _currentDevice;
   if (!device) return;
   document.getElementById("e-name").value = device.name || "";
