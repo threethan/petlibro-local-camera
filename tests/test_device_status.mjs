@@ -9,11 +9,14 @@ function setup(pingEnabled = false) {
   let cameraStops = 0;
   const scope = vm.createContext({
     console,
-    document: { hidden: false, getElementById: () => badge },
+    document: { hidden: false, getElementById: id => id === 'detail-status-badge' ? badge : null },
     _currentDevice: { serial: 'feeder', online: true },
     _devices: [],
     _settings: { device_ping_enabled: pingEnabled },
     renderDevices() {}, renderPets() {}, renderSettings() {},
+    syncBackgroundCameras() {},
+    lastFedLabel: () => '', nextMealLabel: () => '',
+    stopCameraTalk() {},
     checkAlerts() {}, checkPetSetup() {},
     t: key => key,
   });

@@ -50,6 +50,10 @@ class VideoBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(camera.live_stream_available(serial))
             self.assertIn("libx264", captured)
             self.assertIn("mp4", captured)
+            self.assertNotIn("-an", captured)
+            self.assertIn("0:a:0?", captured)
+            self.assertEqual(captured[captured.index("-c:a") + 1], "aac")
+            self.assertEqual(captured[captured.index("-profile:a") + 1], "aac_low")
             await stream.aclose()
 
         self.assertTrue(process.killed)

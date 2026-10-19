@@ -14,6 +14,7 @@ async function loadAll() {
       api("GET", "/api/pets"),
       api("GET", "/api/settings"),
     ]);
+    if (typeof applyTabVisibility === "function") applyTabVisibility();
   } catch(e) {
     console.error("Load error", e);
   }
@@ -124,6 +125,7 @@ function toggleAlertPanel() {
     panel.innerHTML = `<div style="padding:12px 16px;font-size:13px;color:var(--pl-subtext)">No active alerts</div>`;
   } else {
     panel.innerHTML = rows.join("");
+    panel.lastElementChild.style.borderBottom = "none";
   }
   panel.style.display = "block";
 

@@ -30,7 +30,10 @@ _last_seen:    dict[str, float]  = {}   # epoch of most recent MQTT message from
 _last_attr_poll: dict[str, float] = {}  # epoch of last proactive ATTR_GET_SERVICE query
 _pending_pings: dict[tuple[str, str], asyncio.Future] = {}
 _ping_tasks: dict[str, asyncio.Task] = {}
+_pending_bindings: dict[str, float] = {}
 _pending_recording_acks: dict[tuple[str, str], asyncio.Future] = {}
+_pending_audio_acks: dict[tuple[str, str], asyncio.Future] = {}
+FEEDING_AUDIO_ACK_TIMEOUT_SECS = 10
 RECORDING_ACK_TIMEOUT_SECS = 5
 _RECORDING_BOOL_FIELDS = frozenset({
     "videoRecordSwitch", "videoWatermarkSwitch", "feedingVideoSwitch",
@@ -338,6 +341,11 @@ def _mark_online(serial: str):
 def _mark_offline(serial: str):
     """Mark device offline, recording the time it first went offline."""
     import time as _t
+    _manual_feed_requests.pop(serial, None)
+    _pending_manual_feed.pop(serial, None)
+    for (device_serial, _), ack in list(_pending_feed_acks.items()):
+        if device_serial == serial and not ack.done():
+            ack.set_exception(RuntimeError("Feeder went offline before confirming the feed"))
     was_online = _online.get(serial, True)
     if was_online:
         _offline_since.setdefault(serial, _t.time())
@@ -533,6 +541,10 @@ async def send_manual_feed(serial: str, grain_num: int) -> bool:
     """Send one dispense; keep it pending until the feeder reports completion."""
     if type(grain_num) is not int or not 1 <= grain_num <= 48:
         raise ValueError("grainNum must be an integer from 1 to 48")
+    import storage as _storage
+    # Each portion is 1/12 cup; enforce the limit for API and HA commands.
+    if grain_num > 6 and _storage.get_settings().get("manual_feed_half_cup_limit", True) is not False:
+        raise ValueError("Manual feeding is limited to 1/2 cup (6 portions)")
     if serial not in _devices:
         raise RuntimeError(f"Unknown feeder {serial[:6]}")
     if _client_ref is None:
@@ -566,7 +578,8 @@ async def send_manual_feed(serial: str, grain_num: int) -> bool:
             _manual_feed_requests.pop(serial, None)
             raise
         published = True
-        _pending_manual_feed[serial] = time.time()
+        if serial in _manual_feed_requests:
+            _pending_manual_feed[serial] = time.time()
         _LOGGER.info(
             "Manual feed sent to %s... topic=%s msgId=%s portions=%d",
             serial[:6], topic, msg_id, grain_num,
@@ -598,6 +611,47 @@ async def send_manual_feed(serial: str, grain_num: int) -> bool:
             ack.cancel()
 
 
+async def set_feeding_audio(serial: str, updates: dict, repetitions: int = 1) -> None:
+    """Set the meal-call flag/file, independently of device prompt sound hours."""
+    if serial not in _devices:
+        raise ValueError("Unknown feeder")
+    if set(updates) - {"enableAudio", "audioUrl"} or not updates:
+        raise ValueError("Unsupported feeding sound settings")
+    if "enableAudio" in updates and type(updates["enableAudio"]) is not bool:
+        raise ValueError("enableAudio must be a boolean")
+    if "audioUrl" in updates and (not isinstance(updates["audioUrl"], str) or
+                                  not updates["audioUrl"].startswith(("http://", "https://"))):
+        raise ValueError("Feeding sound requires an HTTP audio URL")
+    if _devices[serial][1] != "camera_feeder":
+        if not await send_command(serial, {**updates, "soundRepititions": repetitions}):
+            raise RuntimeError("Feeding sound command was not sent")
+        return
+    if not _online.get(serial):
+        raise RuntimeError("Camera feeder is offline")
+    if any(key[0] == serial for key in _pending_audio_acks):
+        raise RuntimeError("A feeding sound change is already awaiting acknowledgement")
+    msg_id = uuid.uuid4().hex
+    key = (serial, msg_id)
+    future = asyncio.get_running_loop().create_future()
+    _pending_audio_acks[key] = future
+    try:
+        if not await send_command(serial, {**updates, "msgId": msg_id}):
+            raise RuntimeError("Feeding sound command was not sent")
+        try:
+            code = await asyncio.wait_for(future, FEEDING_AUDIO_ACK_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Feeder did not acknowledge the feeding sound") from None
+        if type(code) is not int or code != 0:
+            raise RuntimeError("Feeder rejected the feeding sound")
+        if "audioUrl" in updates:
+            _audio_urls[serial] = updates["audioUrl"]
+        _state.setdefault(serial, {}).update({k: v for k, v in updates.items() if k != "audioUrl"})
+        await _persist_state_cache(serial)
+        await _publish_ha_state(serial)
+    finally:
+        _pending_audio_acks.pop(key, None)
+
+
 def _granary_settings_bundle(serial: str, overrides: dict) -> dict:
     """Build a full Granary Smart Feeder settings payload from currently-known
     state, with one or more fields overridden.
@@ -612,12 +666,15 @@ def _granary_settings_bundle(serial: str, overrides: dict) -> dict:
     state = _state.get(serial, {})
     bundle = {
         "volume":                state.get("volume", 50),
-        "audioUrl":               state.get("audioUrl", ""),
         "enableAudio":            state.get("enableAudio", False),
         "lightSwitch":            state.get("lightSwitch", True),
         "lightAgingType":         state.get("lightAgingType", 1),
         "disableHardwareButton":  state.get("disableHardwareButton", False),
     }
+    # audioUrl is deliberately excluded from _state as sensitive. Reading it
+    # there used to send an empty URL on unrelated settings changes.
+    if _audio_urls.get(serial):
+        bundle["audioUrl"] = _audio_urls[serial]
     bundle.update(overrides)
     return bundle
 
@@ -786,7 +843,7 @@ async def send_display_frame(serial: str, frame: list) -> bool:
         return False
 
 
-def _wire_plans(plans: list) -> list:
+def _wire_plans(plans: list, *, camera_feeder=False, service_push=False) -> list:
     """Plans as the feeder should get them: enabled only, our _enabled flag
     removed, a skipEndTime dropped once it is in the past, sorted by time."""
     import time as _t
@@ -795,7 +852,16 @@ def _wire_plans(plans: list) -> list:
     for p in plans:
         if not p.get("_enabled", True):
             continue
-        q = {k: v for k, v in p.items() if k != "_enabled"}
+        q = {k: v for k, v in p.items() if not k.startswith("_") and k != "label"}
+        if camera_feeder:
+            # Captured PLAF203 service pushes use seven entries, selected
+            # weekdays first (Sunday=7), followed by zero padding. Event
+            # responses use the same selected days without padding.
+            days = q.get("repeatDay", [])
+            selected = {day for day in days if type(day) is int and 1 <= day <= 7}
+            q["repeatDay"] = [day for day in (7, 1, 2, 3, 4, 5, 6) if day in selected]
+            if service_push:
+                q["repeatDay"] += [0] * (7 - len(q["repeatDay"]))
         if isinstance(q.get("skipEndTime"), (int, float)) and q["skipEndTime"] <= now_ms:
             q.pop("skipEndTime")
         out.append(q)
@@ -818,7 +884,7 @@ async def send_feeding_plans(serial: str, plans: list) -> bool:
     import storage as _storage
     if _storage.schedules_paused(serial):
         plans = []
-    clean = _wire_plans(plans)
+    clean = _wire_plans(plans, camera_feeder=device_type == "camera_feeder", service_push=True)
     payload = json.dumps({
         "cmd":    "FEEDING_PLAN_SERVICE",
         "ts":     int(time.time() * 1000),
@@ -1139,6 +1205,10 @@ async def _handle_ha_command(serial: str, topic: str, payload: str):
 
 async def handle_ha_command(serial: str, cmd: dict) -> None:
     """Public entry-point for API-driven commands (already-parsed dict)."""
+    if (_devices.get(serial, (None, None))[1] == "camera_feeder" and
+            {"enableAudio", "audioUrl"}.intersection(cmd)):
+        await set_feeding_audio(serial, cmd)
+        return
     if _SD_CARD_FIELDS.intersection(cmd):
         raise ValueError("SD card status and capability fields are read-only")
     if _RECORDING_FIELDS.intersection(cmd):
@@ -1359,6 +1429,41 @@ async def _send_camera_settings(serial: str, updates: dict) -> None:
     finally:
         _pending_recording_acks.pop(ack_key, None)
 
+def expect_binding(serial: str):
+    """Allow binding replies for a freshly captured feeder before UI save."""
+    if not isinstance(serial, str) or not serial.startswith("AF"):
+        return
+    _pending_bindings[serial] = time.monotonic() + 300
+    if _reconnect_event:
+        _reconnect_event.set()
+
+
+async def _respond_binding(client, topic: str, raw: str) -> bool:
+    parts = topic.split("/")
+    if len(parts) != 6 or parts[:2] != ["dl", "PLAF203"] or parts[3:] != ["device", "system", "post"]:
+        return False
+    serial = parts[2]
+    configured = _devices.get(serial, (None, None))[1] == "camera_feeder"
+    if not configured and _pending_bindings.get(serial, 0) <= time.monotonic():
+        return False
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict) or data.get("cmd") != "BINDING":
+        return False
+    msg_id = data.get("msgId")
+    if not isinstance(msg_id, str) or not msg_id or len(msg_id) > 256:
+        return False
+    # Observed cloud->feeder reply on 2026-10-18, firmware 3.0.30.
+    # bindId=15 is the captured value; its wider semantics are unknown.
+    payload = {"cmd": "BINDING", "ts": int(time.time() * 1000),
+               "msgId": msg_id, "code": 0, "bindId": 15}
+    await client.publish("/".join(parts[:-1] + ["sub"]), json.dumps(payload), retain=False)
+    _LOGGER.info("Binding response sent to %s... (bindId=15)", serial[:6])
+    return True
+
+
 def _handle_message(serial: str, topic_str: str, raw: str):
     try:
         data = json.loads(raw)
@@ -1369,6 +1474,16 @@ def _handle_message(serial: str, topic_str: str, raw: str):
     cmd = data.get("cmd")
     msg_id = data.get("msgId")
     if cmd == "ATTR_SET_SERVICE" and isinstance(msg_id, str):
+        audio_ack = _pending_audio_acks.get((serial, msg_id))
+        if (audio_ack is not None and not audio_ack.done() and
+                topic_str == f"dl/PLAF203/{serial}/device/service/post"):
+            # PLAF203's captured sound ACKs contain cmd/msgId/ts, with no
+            # code. An explicit error still rejects the change; absence is
+            # the normal success reply, not a failed sound download.
+            audio_code = data.get("code", 0)
+            audio_ack.set_result(audio_code)
+            if type(audio_code) is not int or audio_code != 0:
+                return
         recording_ack = _pending_recording_acks.get((serial, msg_id))
         if recording_ack is not None and not recording_ack.done():
             recording_ack.set_result(data.get("code"))
@@ -1394,7 +1509,7 @@ def _handle_message(serial: str, topic_str: str, raw: str):
 
     if cmd == "GET_FEEDING_PLAN_EVENT":
         _ntp_logger.info("FEEDING_PLAN REQUEST from %s... (%s)", serial[:6], _device_name(serial))
-        asyncio.ensure_future(_respond_feeding_plan(serial, topic_str))
+        asyncio.ensure_future(_respond_feeding_plan(serial, topic_str, data.get("msgId")))
         return
 
     if cmd == "DETECTION_EVENT":
@@ -1773,7 +1888,7 @@ def _handle_message(serial: str, topic_str: str, raw: str):
     _mark_online(serial)
 
 
-async def _respond_feeding_plan(serial: str, request_topic: str) -> None:
+async def _respond_feeding_plan(serial: str, request_topic: str, msg_id=None) -> None:
     import time as _time
     global _client_ref
     if _client_ref is None:
@@ -1783,13 +1898,16 @@ async def _respond_feeding_plan(serial: str, request_topic: str) -> None:
     # will report code 2099 but runs its stored schedule autonomously.
     import storage as _storage
     stored_plans = _storage.get_active_feeding_plans(serial)
-    clean_plans = _wire_plans(stored_plans)
-    payload = json.dumps({
+    clean_plans = _wire_plans(stored_plans, camera_feeder=_devices.get(serial, (None, None))[1] == "camera_feeder")
+    response = {
         "cmd":   "GET_FEEDING_PLAN_EVENT",
         "code":  0,
         "ts":    int(_time.time() * 1000),
         "plans": clean_plans,
-    })
+    }
+    if isinstance(msg_id, str) and msg_id:
+        response["msgId"] = msg_id
+    payload = json.dumps(response)
     try:
         await _client_ref.publish(response_topic, payload)
         _LOGGER.info("Feeding plan response sent to %s... (%d plans)", serial[:6], len(clean_plans))
@@ -2652,7 +2770,11 @@ async def _mqtt_loop():
     while True:
         if _reconnect_event:
             _reconnect_event.clear()
-        if not _devices:
+        now = time.monotonic()
+        for serial, deadline in list(_pending_bindings.items()):
+            if deadline <= now:
+                _pending_bindings.pop(serial, None)
+        if not _devices and not _pending_bindings:
             if _reconnect_event:
                 try:
                     await asyncio.wait_for(_reconnect_event.wait(), timeout=5)
@@ -2738,6 +2860,8 @@ async def _mqtt_loop():
                             "recognized": recognized,
                         })
                         _prune_raw_capture(_now)
+                        if await _respond_binding(client, topic_str, payload_str):
+                            continue
                         if recognized:
                             _handle_message(serial, topic_str, payload_str)
                         elif serial not in _unrecognized_serials_seen:

@@ -21,6 +21,9 @@ CAMERA_SNAPSHOT_INTERVAL_MAX_SECONDS = 300
 DEFAULT_SETTINGS = {
     "language": "en",
     "device_ping_enabled": True,
+    "manual_feed_half_cup_limit": True,
+    "show_videos_tab": True,
+    "show_pets_tab": True,
     "mqtt_host": "localhost",
     "mqtt_port": 1883,
     "mqtt_user": "",
@@ -36,9 +39,13 @@ DEFAULT_SETTINGS = {
     "camera_snapshot_interval_secs": 15,
     "camera_snapshot_enabled": False,
     "camera_vp8_transcoding": False,
+    "camera_h264_startup_fix": True,
     "camera_auto_start_live_view": False,
     "camera_preload_live_feeds": False,
+    "camera_stream_lifetime": "viewing",
+    "feeder_card_display": "product",
     "camera_force_landscape_mobile": False,
+    "camera_fullscreen_rotation": "off",
 }
 
 ALLOWED_SETTINGS = set(DEFAULT_SETTINGS.keys()) | {"feeder_timezone"}
@@ -168,14 +175,29 @@ def _save(data: dict):
 
 def get_settings() -> dict:
     stored = _load().get("settings", {})
-    return {**DEFAULT_SETTINGS, **stored}
+    settings = {**DEFAULT_SETTINGS, **stored}
+    if "camera_stream_lifetime" not in stored and stored.get("camera_preload_live_feeds") is True:
+        settings["camera_stream_lifetime"] = "web_interface"
+    if "camera_fullscreen_rotation" not in stored and stored.get("camera_force_landscape_mobile") is True:
+        settings["camera_fullscreen_rotation"] = "counterclockwise"
+    return settings
 
 
 def save_settings(updates: dict) -> dict:
     data = _load()
     current = {**DEFAULT_SETTINGS, **data.get("settings", {})}
+    if "camera_stream_lifetime" not in data.get("settings", {}) and current["camera_preload_live_feeds"]:
+        current["camera_stream_lifetime"] = "web_interface"
+    if "camera_fullscreen_rotation" not in data.get("settings", {}) and current["camera_force_landscape_mobile"]:
+        current["camera_fullscreen_rotation"] = "counterclockwise"
     for key, val in updates.items():
         if key in ALLOWED_SETTINGS:
+            if key == "camera_stream_lifetime" and val not in ("viewing", "web_interface", "home_assistant"):
+                raise ValueError("Invalid camera stream lifetime")
+            if key == "camera_fullscreen_rotation" and val not in ("off", "clockwise", "counterclockwise"):
+                raise ValueError("Invalid fullscreen rotation")
+            if key == "feeder_card_display" and val not in ("product", "live", "snapshot"):
+                raise ValueError("Invalid feeder card display")
             if key == "camera_snapshot_interval_secs":
                 if isinstance(val, bool) or not isinstance(val, int):
                     raise ValueError("Camera snapshot interval must be a whole number of seconds")
@@ -187,11 +209,15 @@ def save_settings(updates: dict) -> dict:
                     )
             if key in {
                 "camera_vp8_transcoding",
+                "camera_h264_startup_fix",
                 "camera_snapshot_enabled",
                 "camera_auto_start_live_view",
                 "camera_preload_live_feeds",
                 "camera_force_landscape_mobile",
                 "device_ping_enabled",
+                "manual_feed_half_cup_limit",
+                "show_videos_tab",
+                "show_pets_tab",
             }:
                 if not isinstance(val, bool):
                     raise ValueError(f"{key} must be a boolean")

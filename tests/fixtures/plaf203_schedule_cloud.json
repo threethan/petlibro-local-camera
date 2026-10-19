@@ -1,0 +1,67 @@
+{
+  "FEEDING_PLAN_SERVICE": [
+    {
+      "planId": 6229292,
+      "executionTime": "17:10",
+      "repeatDay": [
+        7,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "enableAudio": true,
+      "audioTimes": 5,
+      "grainNum": 48,
+      "syncTime": 1792170624000
+    },
+    {
+      "planId": 6209090,
+      "executionTime": "05:34",
+      "repeatDay": [
+        7,
+        1,
+        2,
+        4,
+        6,
+        0,
+        0
+      ],
+      "enableAudio": true,
+      "audioTimes": 2,
+      "grainNum": 32,
+      "syncTime": 1792123000000
+    }
+  ],
+  "GET_FEEDING_PLAN_EVENT": [
+    {
+      "planId": 6229292,
+      "executionTime": "17:10",
+      "repeatDay": [
+        7,
+        1
+      ],
+      "enableAudio": true,
+      "audioTimes": 5,
+      "grainNum": 48,
+      "syncTime": 1792170624000
+    },
+    {
+      "planId": 6209090,
+      "executionTime": "05:34",
+      "repeatDay": [
+        7,
+        1,
+        2,
+        4,
+        6
+      ],
+      "enableAudio": true,
+      "audioTimes": 2,
+      "grainNum": 32,
+      "syncTime": 1792123000000
+    }
+  ]
+}

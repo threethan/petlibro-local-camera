@@ -13,14 +13,23 @@ RUN git init /src \
 	&& git -C /src checkout --detach FETCH_HEAD
 COPY camera-bridge-audio.patch /tmp/camera-bridge-audio.patch
 COPY camera-bridge-talkback.patch /tmp/camera-bridge-talkback.patch
-RUN git -C /src apply --check /tmp/camera-bridge-audio.patch \
+COPY camera-bridge-recordings.patch /tmp/camera-bridge-recordings.patch
+COPY camera-bridge-sps-pps.patch /tmp/camera-bridge-sps-pps.patch
+# Local Home Assistant builds may copy patches directly from a Windows folder.
+RUN sed -i 's/\r$//' /tmp/camera-bridge-audio.patch /tmp/camera-bridge-talkback.patch /tmp/camera-bridge-recordings.patch /tmp/camera-bridge-sps-pps.patch \
+    && git -C /src apply --check /tmp/camera-bridge-audio.patch \
     && git -C /src apply /tmp/camera-bridge-audio.patch \
     && git -C /src apply --check /tmp/camera-bridge-talkback.patch \
-    && git -C /src apply /tmp/camera-bridge-talkback.patch
+    && git -C /src apply /tmp/camera-bridge-talkback.patch \
+    && git -C /src apply --check /tmp/camera-bridge-recordings.patch \
+    && git -C /src apply /tmp/camera-bridge-recordings.patch \
+    && git -C /src apply --check /tmp/camera-bridge-sps-pps.patch \
+    && git -C /src apply /tmp/camera-bridge-sps-pps.patch
 COPY camera-talkback/internal/bridge/talkback.go /src/camera-bridge/internal/bridge/talkback.go
 COPY camera-talkback/internal/bridge/talkback_test.go /src/camera-bridge/internal/bridge/talkback_test.go
 COPY camera-talkback/internal/plaf203/talkback.go /src/camera-bridge/internal/plaf203/talkback.go
 COPY camera-talkback/internal/plaf203/talkback_test.go /src/camera-bridge/internal/plaf203/talkback_test.go
+COPY camera-recordings/internal/ /src/camera-bridge/internal/
 WORKDIR /src/camera-bridge
 RUN go test ./... \
     && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
@@ -31,7 +40,7 @@ FROM ghcr.io/home-assistant/base-python:latest
 
 RUN apk add --no-cache ffmpeg
 
-RUN pip3 install --no-cache-dir aiohttp aiomqtt tzdata
+RUN pip3 install --no-cache-dir aiohttp aiomqtt tzdata bleak==3.0.1
 
 COPY app/ /app/
 COPY icon.png /app/icon.png

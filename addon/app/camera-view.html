@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Petlibro Live Camera</title>
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<script>window.__BASE__ = "{{BASE}}"; window.__VERSION__ = "{{VERSION}}";</script>
+<link rel="stylesheet" href="app.css?v={{VERSION}}">
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:transparent; }
+  #camera-view, .overview-live-camera { width:100%; height:100%; margin:0; }
+  .overview-live-camera > .tab-section-heading { display:none; }
+  .overview-live-camera-frame { height:100%; aspect-ratio:auto; border-radius:0; }
+  .camera-device-link { position:absolute; inset:0; z-index:1; pointer-events:auto; }
+  .camera-device-link:focus-visible { outline:2px solid #fff; outline-offset:-4px; }
+  #camera-view-message { display:grid; place-items:center; height:100%; padding:16px; text-align:center; }
+</style>
+<script src="theme.js?v={{VERSION}}"></script>
+</head>
+<body>
+<main id="camera-view"><div id="camera-view-message" role="status">Connecting…</div></main>
+<script src="util.js?v={{VERSION}}"></script>
+<script src="api.js?v={{VERSION}}"></script>
+<script src="modal-device.js?v={{VERSION}}"></script>
+<script src="background-camera.js?v={{VERSION}}"></script>
+<script src="camera-talk.js?v={{VERSION}}"></script>
+<script src="camera-view.js?v={{VERSION}}"></script>
+</body>
+</html>

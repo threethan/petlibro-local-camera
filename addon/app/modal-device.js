@@ -41,7 +41,9 @@ function releaseCameraPower(serial, owner) {
   const lease = _cameraPowerOwners.get(serial);
   if (!lease || !lease.owners.delete(owner) || lease.owners.size) return;
   _cameraPowerOwners.delete(serial);
-  setLiveCameraPower(serial, false).catch(() => {});
+  if (_settings.camera_stream_lifetime !== "home_assistant") {
+    setLiveCameraPower(serial, false).catch(() => {});
+  }
 }
 function stopLiveCamera() {
   _liveCameraGeneration++;
@@ -104,10 +106,10 @@ function stopLiveCameraRecording() {
 }
 function exitLiveCameraFullscreen() {
   const frame = document.getElementById("camera-live-frame");
-  const fullscreenFrame = document.fullscreenElement?.id === "camera-live-frame" ? document.fullscreenElement : null;
-  if (fullscreenFrame) document.exitFullscreen?.().catch(() => {});
-  fullscreenFrame?.classList.remove("is-landscape-rotated");
-  frame?.classList.remove("is-fullscreen-fallback", "is-landscape-rotated");
+  const fullscreenFrame = cameraFullscreenElement()?.id === "camera-live-frame" ? cameraFullscreenElement() : null;
+  if (fullscreenFrame) Promise.resolve((document.exitFullscreen || document.webkitExitFullscreen)?.call(document)).catch(() => {});
+  fullscreenFrame?.classList.remove("is-landscape-rotated", "is-rotation-clockwise", "is-video-fullscreen");
+  frame?.classList.remove("is-fullscreen-fallback", "is-landscape-rotated", "is-rotation-clockwise", "is-video-fullscreen");
   _liveCameraFullscreenFallback = false;
   const button = document.getElementById("camera-live-fullscreen");
   if (button) {
@@ -125,25 +127,44 @@ function isMobileCameraClient() {
     || (client?.maxTouchPoints > 0 && window.matchMedia?.("(pointer: coarse)").matches
       && window.screen?.width < window.screen?.height && window.screen.width <= 1280);
 }
-function useMobileLandscapeFallback() {
-  return _settings.camera_force_landscape_mobile === true && isMobileCameraClient();
+function cameraFullscreenRotation() {
+  return _settings.camera_fullscreen_rotation ?? (_settings.camera_force_landscape_mobile === true ? "counterclockwise" : "off");
+}
+function syncCameraFullscreenRotation(frame, active) {
+  const portrait = window.matchMedia?.("(orientation: portrait)").matches ?? window.innerHeight > window.innerWidth;
+  const mode = cameraFullscreenRotation();
+  const rotate = active && isMobileCameraClient() && portrait && mode !== "off";
+  frame?.classList.toggle("is-landscape-rotated", rotate);
+  frame?.classList.toggle("is-rotation-clockwise", rotate && mode === "clockwise");
+  frame?.classList.toggle("is-video-fullscreen", active);
+}
+function cameraFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement;
+}
+async function enterCameraFullscreen(frame) {
+  try {
+    if (frame.requestFullscreen) await frame.requestFullscreen({ navigationUI: "hide" });
+    else if (frame.webkitRequestFullscreen) await frame.webkitRequestFullscreen();
+    else throw new Error("Fullscreen API unavailable");
+    return;
+  } catch { /* Embedded browsers may reject container fullscreen. */ }
+  const video = frame.querySelector("video");
+  if (video?.webkitEnterFullscreen) {
+    try {
+      video.webkitEnterFullscreen();
+      return;
+    } catch { /* Fall back to filling the viewport if native playback is unavailable. */ }
+  }
+  frame.classList.add("is-fullscreen-fallback");
 }
 async function enterLiveCameraFullscreen(frame) {
-  if (!useMobileLandscapeFallback()) {
-    try {
-      if (!frame.requestFullscreen) throw new Error("Fullscreen API unavailable");
-      await frame.requestFullscreen();
-      return;
-    } catch { /* Embedded browsers may reject the Fullscreen API. */ }
-  }
-  _liveCameraFullscreenFallback = true;
-  frame.classList.add("is-fullscreen-fallback");
+  await enterCameraFullscreen(frame);
+  _liveCameraFullscreenFallback = frame.classList.contains("is-fullscreen-fallback");
 }
 function syncLiveCameraFullscreen() {
   const frame = document.getElementById("camera-live-frame");
-  const active = !!frame && (document.fullscreenElement === frame || _liveCameraFullscreenFallback);
-  const portrait = window.matchMedia?.("(orientation: portrait)").matches ?? window.innerHeight > window.innerWidth;
-  if (frame) frame.classList.toggle("is-landscape-rotated", active && useMobileLandscapeFallback() && portrait);
+  const active = !!frame && (cameraFullscreenElement() === frame || _liveCameraFullscreenFallback);
+  syncCameraFullscreenRotation(frame, active);
   const button = document.getElementById("camera-live-fullscreen");
   if (button) {
     button.innerHTML = `<span class="material-icons" aria-hidden="true">${active ? "fullscreen_exit" : "fullscreen"}</span>`;
@@ -188,6 +209,10 @@ document.addEventListener?.("fullscreenchange", () => {
   syncLiveCameraFullscreen();
   resumeLiveCameraPlayback();
 });
+document.addEventListener?.("webkitfullscreenchange", () => {
+  syncLiveCameraFullscreen();
+  resumeLiveCameraPlayback();
+});
 globalThis.window?.addEventListener("orientationchange", syncLiveCameraFullscreen);
 globalThis.window?.addEventListener("resize", syncLiveCameraFullscreen);
 document.addEventListener?.("keydown", event => {
@@ -202,13 +227,13 @@ function closeLiveCameraWebrtc() {
   _liveCameraSerial = null;
 }
 function openLiveCameraVideoBridge(serial, frame, onEnd) {
-  const mimeType = 'video/mp4; codecs="avc1.42C01F"';
+  const mimeType = 'video/mp4; codecs="avc1.42C01F, mp4a.40.2"';
   if (!window.MediaSource || !MediaSource.isTypeSupported(mimeType)) {
     throw new Error("This browser cannot play the camera video bridge.");
   }
   const video = document.createElement("video");
   video.autoplay = true; video.playsInline = true; video.muted = true;
-  video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain";
+  video.className = "camera-video";
   const source = new MediaSource();
   const url = URL.createObjectURL(source);
   const controller = new AbortController();
@@ -479,7 +504,7 @@ function buildCameraStorageStatus(device) {
   const capacity = value => value >= 1024 ? `${(value / 1024).toFixed(1)} GB` : `${value} MB`;
   const hasUsage = total !== null && total > 0 && used !== null && used <= total;
   const filesystem = typeof device.sdCardFileSystem === "string" ? device.sdCardFileSystem.trim() : "";
-  return `<section class="sd-card-panel" aria-label="SD card storage">
+  return `<section class="ha-card sd-card-panel" aria-label="SD card storage">
     <div class="sd-card-top">
       <span class="sd-card-title"><span class="material-icons" aria-hidden="true">sd_card</span>SD card</span>
       <span class="sd-card-capacity">${total > 0 ? capacity(total) : "Capacity unknown"}</span>
@@ -487,6 +512,7 @@ function buildCameraStorageStatus(device) {
     ${hasUsage ? `<div class="sd-card-summary"><strong>${capacity(total - used)} free</strong><span>${capacity(used)} used</span></div>
       <div class="sd-card-track" role="progressbar" aria-label="SD card space used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(used / total * 100)}"><div class="sd-card-fill" style="width:${used / total * 100}%"></div></div>` : ""}
     ${filesystem ? `<div class="sd-card-meta">Filesystem: ${escHtml(filesystem)}</div>` : ""}
+    <p class="form-hint">Close the device and check the Recordings page to view recordings saved to the SD card</p>
   </section>`;
 }
 
@@ -509,8 +535,9 @@ function buildCameraSettingsTab(device, category = "all") {
     (category === "sensors" && ["video", "sound-detection", "motion", "recording", "feeding-video"].includes(name)) ||
     (category === "overview" && ["sound", "indicators"].includes(name));
   const utcToLocalOrEmpty = value => value ? _utcToLocal(value) : "";
-  const powerWithLiveView = device.camera_power_with_live_view === true;
-  const powerWithLiveViewControl = `<div class="camera-ha-expose-row">
+  const persistentLiveCamera = _settings.camera_stream_lifetime === "home_assistant";
+  const powerWithLiveView = device.camera_power_with_live_view === true && !persistentLiveCamera;
+  const powerWithLiveViewControl = persistentLiveCamera ? "" : `<div class="camera-ha-expose-row">
       <div class="camera-ha-expose-copy">
         <label class="camera-ha-expose-label" for="camera-power-with-live-view">${t("settings.camera_power_with_live_view")}</label>
         <p class="camera-ha-expose-hint">${t("settings.camera_power_with_live_view_hint")}</p>
@@ -532,7 +559,7 @@ function buildCameraSettingsTab(device, category = "all") {
     ${show("indicators") ? section("Indicator lights", "lightSwitch", device.lightSwitch !== false, `
       ${schedule("indicators", "lightAgingType", device.lightAgingType, "lightingStartTime", device.lightingStartTime || utcToLocalOrEmpty(device.lightingStartTimeUtc) || "00:00", "lightingEndTime", device.lightingEndTime || utcToLocalOrEmpty(device.lightingEndTimeUtc) || "23:59")}
     `) : ""}
-    ${show("recording") ? noSdCardDetected(device) ? `<div class="sd-card-empty"><span class="material-icons" aria-hidden="true">sd_card</span>No SD Card Detected</div>` : buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
+    ${show("recording") ? noSdCardDetected(device) ? `<div class="ha-card sd-card-empty"><span class="material-icons" aria-hidden="true">sd_card</span>No SD Card Detected</div>` : buildCameraStorageStatus(device) + section("SD card recording", "videoRecordSwitch", device.videoRecordSwitch === true, `
       <p class="form-hint">The feeder saves video to its SD card. Motion recording also requires Motion Detection to be enabled with overlapping hours.</p>
       ${choice("Recording mode", "videoRecordMode", device.videoRecordMode || "CONTINUOUS", [["CONTINUOUS", "Continuous"], ["MOTION_DETECTION", "Motion detection"]])}
       ${schedule("recording", "videoRecordAgingType", device.videoRecordAgingType, "videoRecordStartTime", device.videoRecordStartTime || utcToLocalOrEmpty(device.videoRecordStartTimeUtc) || "00:00", "videoRecordEndTime", device.videoRecordEndTime || utcToLocalOrEmpty(device.videoRecordEndTimeUtc) || "23:59")}
@@ -581,6 +608,41 @@ function buildFeedTimingStats(device) {
       <div class="detail-stat-value" id="detail-next-feed">${escHtml(nextFeed)}</div>
     </div>
   </div>`;
+}
+
+function buildLiveCameraView(device) {
+    const ua = navigator.userAgent || "";
+    const platform = navigator.userAgentData?.platform || navigator.platform || "";
+    const brands = navigator.userAgentData?.brands?.map(brand => brand.brand).join(" ") || "";
+    const isWindowsChrome = /windows/i.test(`${platform} ${ua}`)
+      && (/chrome/i.test(brands) || /Chrome\//.test(ua))
+      && !/Edg|OPR|Opera/i.test(`${brands} ${ua}`);
+    return device.device_type === "camera_feeder" ? `<section class="overview-live-camera">
+      ${isWindowsChrome ? `<div class="ha-card" style="padding:12px; margin-bottom:12px" id="camera-windows-vp8-hint" hidden>${t("camera.windows_vp8_hint")}</div>` : ""}
+      <div class="tab-section-heading">Live camera</div>
+      <div class="overview-live-camera-frame" id="camera-live-frame">
+        <img class="overview-live-camera-snapshot" id="camera-live-snapshot-image" src="${BASE}/api/devices/${encodeURIComponent(device.serial)}/camera/snapshot" alt="Latest camera snapshot" hidden>
+        <div class="overview-live-camera-overlay">
+        <button type="button" class="overview-live-camera-start" id="camera-live-start">Start live view</button>
+        <div class="overview-live-camera-controls" id="camera-live-controls" aria-label="Live camera settings">
+          <label class="overview-live-camera-select-chip" title="Resolution"><span class="material-icons" aria-hidden="true">high_quality</span><span class="camera-control-value">1080p</span><select id="camera-live-resolution" aria-label="Resolution"><option value="P1080">1080p</option><option value="P720">720p</option></select></label>
+          <label class="overview-live-camera-select-chip" title="Night vision"><span class="material-icons" aria-hidden="true">nightlight</span><span class="camera-control-value">Auto</span><select id="camera-live-night-vision" aria-label="Night vision"><option value="AUTOMATIC">Auto</option><option value="OPEN">On</option><option value="CLOSE">Off</option></select></label>
+          <button type="button" class="overview-live-camera-action overview-live-camera-talk-action" id="camera-talk-toggle" aria-label="Talk" title="Talk" aria-pressed="false"><span class="material-icons" aria-hidden="true">mic</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-snapshot" aria-label="Download snapshot" title="Download snapshot"><span class="material-icons" aria-hidden="true">photo_camera</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-record" aria-label="Record video" aria-pressed="false" title="Record video"><span class="material-icons" aria-hidden="true">videocam</span></button>
+          <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
+        </div>
+        <div class="overview-live-camera-top-controls" aria-label="Video view controls">
+          <button type="button" class="overview-live-camera-sound" id="camera-live-sound" aria-label="Turn camera sound on" title="Turn sound on" hidden><span class="material-icons" aria-hidden="true">volume_off</span></button>
+          <button type="button" class="overview-live-camera-action" id="camera-live-fullscreen" aria-label="Fullscreen" title="Fullscreen"><span class="material-icons" aria-hidden="true">fullscreen</span></button>
+        </div>
+        <div class="overview-live-camera-status-group">
+          <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
+          <span id="camera-talk-status" role="status" aria-live="polite"></span>
+        </div>
+        </div>
+      </div>
+    </section>` : "";
 }
 
 function buildOverviewTab(device) {
@@ -652,11 +714,7 @@ function buildOverviewTab(device) {
         <div class="feed-amount-control">
           <label>${t("overview.portions")}</label>
           <select class="form-input" id="feeder-portions">
-          <option value="1" selected>${fmtPortions(1, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="2">${fmtPortions(2, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="3">${fmtPortions(3, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="4">${fmtPortions(4, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="5">${fmtPortions(5, device.calibrated_grams_per_portion, device.feed_unit)}</option>
+            ${Array.from({length: _settings.manual_feed_half_cup_limit !== false ? 6 : 48}, (_, i) => i + 1).map(n => `<option value="${n}"${n === 1 ? " selected" : ""}>${escHtml(fmtPortions(n, device.calibrated_grams_per_portion, device.feed_unit))}</option>`).join("")}
           </select>
         </div>
         <button class="btn-primary" id="btn-feed-now">${t("overview.feed_now")}</button>
@@ -721,36 +779,7 @@ function buildOverviewTab(device) {
     const battLabel  = hasBattery ? `${device.electricQuantity}%` : "—";
     const lightOn    = !!device.lightSwitch;
     const lockOn     = !!device.disableHardwareButton;
-    const ua = navigator.userAgent || "";
-    const platform = navigator.userAgentData?.platform || navigator.platform || "";
-    const brands = navigator.userAgentData?.brands?.map(brand => brand.brand).join(" ") || "";
-    const isWindowsChrome = /windows/i.test(`${platform} ${ua}`)
-      && (/chrome/i.test(brands) || /Chrome\//.test(ua))
-      && !/Edg|OPR|Opera/i.test(`${brands} ${ua}`);
-    const liveCameraHtml = device.device_type === "camera_feeder" ? `<section class="overview-live-camera">
-      ${isWindowsChrome ? `<div class="ha-card" style="padding:12px; margin-bottom:12px" id="camera-windows-vp8-hint" hidden>${t("camera.windows_vp8_hint")}</div>` : ""}
-      <div class="tab-section-heading">Live camera</div>
-      <div class="overview-live-camera-frame" id="camera-live-frame">
-        <img class="overview-live-camera-snapshot" id="camera-live-snapshot-image" src="${BASE}/api/devices/${encodeURIComponent(device.serial)}/camera/snapshot" alt="Latest camera snapshot" hidden>
-        <button type="button" class="overview-live-camera-start" id="camera-live-start">Start live view</button>
-        <div class="overview-live-camera-controls" id="camera-live-controls" aria-label="Live camera settings">
-          <label class="overview-live-camera-select-chip" title="Resolution"><span class="material-icons" aria-hidden="true">high_quality</span><span class="camera-control-value">1080p</span><select id="camera-live-resolution" aria-label="Resolution"><option value="P1080">1080p</option><option value="P720">720p</option></select></label>
-          <label class="overview-live-camera-select-chip" title="Night vision"><span class="material-icons" aria-hidden="true">nightlight</span><span class="camera-control-value">Auto</span><select id="camera-live-night-vision" aria-label="Night vision"><option value="AUTOMATIC">Auto</option><option value="OPEN">On</option><option value="CLOSE">Off</option></select></label>
-          <button type="button" class="overview-live-camera-action overview-live-camera-talk-action" id="camera-talk-toggle" aria-label="Talk" title="Talk" aria-pressed="false"><span class="material-icons" aria-hidden="true">mic</span></button>
-          <button type="button" class="overview-live-camera-action" id="camera-live-snapshot" aria-label="Download snapshot" title="Download snapshot"><span class="material-icons" aria-hidden="true">photo_camera</span></button>
-          <button type="button" class="overview-live-camera-action" id="camera-live-record" aria-label="Record video" aria-pressed="false" title="Record video"><span class="material-icons" aria-hidden="true">videocam</span></button>
-          <button type="button" class="overview-live-camera-stop" id="camera-live-stop" aria-label="Stop live view"><span class="material-icons" aria-hidden="true">stop</span></button>
-        </div>
-        <div class="overview-live-camera-top-controls" aria-label="Video view controls">
-          <button type="button" class="overview-live-camera-sound" id="camera-live-sound" aria-label="Turn camera sound on" title="Turn sound on" hidden><span class="material-icons" aria-hidden="true">volume_off</span></button>
-          <button type="button" class="overview-live-camera-action" id="camera-live-fullscreen" aria-label="Fullscreen" title="Fullscreen"><span class="material-icons" aria-hidden="true">fullscreen</span></button>
-        </div>
-        <div class="overview-live-camera-status-group">
-          <span class="overview-live-camera-status" id="camera-live-status" role="status" aria-live="polite"></span>
-          <span id="camera-talk-status" role="status" aria-live="polite"></span>
-        </div>
-      </div>
-    </section>` : "";
+    const liveCameraHtml = buildLiveCameraView(device);
     return `${liveCameraHtml}<div class="detail-stats">
       <div class="ha-card" style="padding:8px 14px">
         <div class="detail-stat-label">${t("overview.food_level")}</div>
@@ -767,11 +796,7 @@ function buildOverviewTab(device) {
         <div class="feed-amount-control">
           <label>${t("overview.portions")}</label>
           <select class="form-input" id="feeder-portions">
-          <option value="1" selected>${fmtPortions(1, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="2">${fmtPortions(2, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="3">${fmtPortions(3, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="4">${fmtPortions(4, device.calibrated_grams_per_portion, device.feed_unit)}</option>
-          <option value="5">${fmtPortions(5, device.calibrated_grams_per_portion, device.feed_unit)}</option>
+            ${Array.from({length: _settings.manual_feed_half_cup_limit !== false ? 6 : 48}, (_, i) => i + 1).map(n => `<option value="${n}"${n === 1 ? " selected" : ""}>${escHtml(fmtPortions(n, device.calibrated_grams_per_portion, device.feed_unit))}</option>`).join("")}
           </select>
         </div>
         <button class="btn-primary" id="btn-feed-now">${t("overview.feed_now")}</button>
@@ -984,61 +1009,77 @@ function buildMaintenanceTab(device) {
     const hCol  = housDays != null && housDays <= 0 ? "var(--pl-danger)" : "var(--pl-accent)";
     return `
     <p class="form-hint" style="margin:0 0 18px">${t("maint.feeder_local_only")}</p>
-    <div class="tab-section-heading">${t("maint.food_tank")}</div>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.next_refill_in")}</span>
-      <input class="form-input" id="maint-food-refill-days" type="number" min="0" max="365"
+    <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.food_tank")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-food-refill-days">${t("maint.next_refill_in")}</label>
+          <input class="form-input" id="maint-food-refill-days" type="number" min="0" max="365"
         value="${foodDays != null ? Math.max(0, Math.round(foodDays)) : ""}"
-        placeholder="${foodDays != null ? "" : t("maint.bowl_not_set")}"
-        style="max-width:90px;color:${fdCol}">
-    </div>
-    <label class="form-label">${t("maint.refill_every")}</label>
-    <div class="maint-action-row">
-      <input class="form-input" id="maint-food-refill-interval" type="number" min="1" max="365" value="${device.food_refill_interval_days ?? 14}">
-      <button class="btn-secondary" id="btn-record-food-refill">${t("maint.record_food_refill")}</button>
-    </div>
+      placeholder="—"
+        style="color:${fdCol}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-record-food-refill" title="${t("maint.record_food_refill")}" aria-label="${t("maint.record_food_refill")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-food-refill-interval">${t("maint.fill_every_inline")}</label>
+          <input class="form-input" id="maint-food-refill-interval" type="number" min="1" max="365" value="${device.food_refill_interval_days ?? 14}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>
 
-    <div class="tab-section-heading">${t("maint.desiccant")}</div>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.days_remaining")}</span>
-      <input class="form-input" id="maint-desiccant-days" type="number" min="0" max="730"
+    <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.desiccant")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-desiccant-days">${t("maint.next_replacement_in")}</label>
+          <input class="form-input" id="maint-desiccant-days" type="number" min="0" max="730"
         value="${dDays != null ? Math.max(0, Math.round(dDays)) : ""}"
-        placeholder="${dDays != null ? "" : t("maint.desiccant_not_set")}"
-        style="max-width:90px;color:${dCol}">
-    </div>
-    <label class="form-label">${t("maint.desiccant_replace_every")}</label>
-    <div class="maint-action-row">
-      <input class="form-input" id="maint-desiccant-life" type="number" min="1" max="365" value="${device.desiccant_life_days ?? 14}">
-      <button class="btn-secondary" id="btn-reset-desiccant">${t("maint.reset_desiccant")}</button>
-    </div>
+      placeholder="—"
+        style="color:${dCol}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-reset-desiccant" title="${t("maint.reset_desiccant")}" aria-label="${t("maint.reset_desiccant")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-desiccant-life">${t("maint.replace_every_inline")}</label>
+          <input class="form-input" id="maint-desiccant-life" type="number" min="1" max="365" value="${device.desiccant_life_days ?? 14}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>
 
-    <div class="tab-section-heading">${t("maint.bowl")}</div>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.next_clean_in")}</span>
-      <input class="form-input" id="maint-bowl-days" type="number" min="0" max="365"
+    <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.bowl")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-bowl-days">${t("maint.next_clean_in")}</label>
+          <input class="form-input" id="maint-bowl-days" type="number" min="0" max="365"
         value="${bowlDays != null ? Math.max(0, Math.round(bowlDays)) : ""}"
-        placeholder="${bowlDays != null ? "" : t("maint.bowl_not_set")}"
-        style="max-width:90px;color:${bCol}">
-    </div>
-    <label class="form-label">${t("maint.bowl_clean_every")}</label>
-    <div class="maint-action-row">
-      <input class="form-input" id="maint-bowl-interval" type="number" min="1" max="90" value="${device.bowl_cleaning_interval_days ?? 7}">
-      <button class="btn-secondary" id="btn-record-bowl">${t("maint.record_bowl")}</button>
-    </div>
+      placeholder="—"
+        style="color:${bCol}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-record-bowl" title="${t("maint.record_bowl")}" aria-label="${t("maint.record_bowl")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-bowl-interval">${t("maint.clean_every_inline")}</label>
+          <input class="form-input" id="maint-bowl-interval" type="number" min="1" max="90" value="${device.bowl_cleaning_interval_days ?? 7}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>
 
-    <div class="tab-section-heading">${t("maint.housing")}</div>
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.next_clean_in")}</span>
-      <input class="form-input" id="maint-housing-days" type="number" min="0" max="365"
+    <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.housing")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-housing-days">${t("maint.next_clean_in")}</label>
+          <input class="form-input" id="maint-housing-days" type="number" min="0" max="365"
         value="${housDays != null ? Math.max(0, Math.round(housDays)) : ""}"
-        placeholder="${housDays != null ? "" : t("maint.bowl_not_set")}"
-        style="max-width:90px;color:${hCol}">
-    </div>
-    <label class="form-label">${t("maint.bowl_clean_every")}</label>
-    <div class="maint-action-row">
-      <input class="form-input" id="maint-housing-interval" type="number" min="1" max="365" value="${device.housing_cleaning_interval_days ?? 30}">
-      <button class="btn-secondary" id="btn-record-housing">${t("maint.record_housing")}</button>
-    </div>`;
+      placeholder="—"
+        style="color:${hCol}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-record-housing" title="${t("maint.record_housing")}" aria-label="${t("maint.record_housing")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-housing-interval">${t("maint.clean_every_inline")}</label>
+          <input class="form-input" id="maint-housing-interval" type="number" min="1" max="365" value="${device.housing_cleaning_interval_days ?? 30}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>`;
   }
 
   const filterDays = filterDaysRemaining(device);
@@ -1056,31 +1097,39 @@ function buildMaintenanceTab(device) {
   const fCol = filterDays != null && filterDays <= 3 ? "var(--pl-danger)" : "var(--pl-accent)";
   const cCol = cleanDays  != null && cleanDays  <  1 ? "var(--pl-danger)" : "";
   return `
-  <div class="tab-section-heading">${t("maint.filter")}</div>
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-    <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.days_remaining")}</span>
-    <input class="form-input" id="maint-filter-days" type="number" min="0" max="730"
+  <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.filter")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-filter-days">${t("maint.next_replacement_in")}</label>
+          <input class="form-input" id="maint-filter-days" type="number" min="0" max="730"
       value="${filterDays != null ? Math.max(0, Math.round(filterDays)) : ""}"
-      style="max-width:90px;${fCol ? `color:${fCol}` : ""}">
-  </div>
-  <label class="form-label">${t("maint.filter_life")}</label>
-  <div style="display:flex;gap:8px;margin-bottom:18px">
-    <input class="form-input" id="maint-filter-life" type="number" min="1" max="365" value="${filterLifeDays}" style="flex:1">
-    <button class="btn-secondary" id="btn-reset-filter" style="flex-shrink:0">${t("maint.reset_filter")}</button>
-  </div>
+      style="${fCol ? `color:${fCol}` : ""}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-reset-filter" title="${t("maint.reset_filter")}" aria-label="${t("maint.reset_filter")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-filter-life">${t("maint.replace_every_inline")}</label>
+          <input class="form-input" id="maint-filter-life" type="number" min="1" max="365" value="${filterLifeDays}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>
 
-  <div class="tab-section-heading">${t("maint.cleaning")}</div>
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-    <span style="font-size:13px;color:var(--pl-subtext);white-space:nowrap">${t("maint.next_cleanup_in")}</span>
-    <input class="form-input" id="maint-clean-days" type="number" min="0" max="365"
+  <section class="maint-timer">
+      <div class="tab-section-heading">${t("maint.cleaning")}</div>
+      <div class="maint-timer-row">
+        <div class="maint-countdown">
+          <label for="maint-clean-days">${t("maint.next_cleanup_in")}</label>
+          <input class="form-input" id="maint-clean-days" type="number" min="0" max="365"
       value="${cleanDays != null ? Math.max(0, Math.round(cleanDays)) : ""}"
-      style="max-width:90px;${cCol ? `color:${cCol}` : ""}">
-  </div>
-  <label class="form-label">${t("maint.cleanup_interval")}</label>
-  <div style="display:flex;gap:8px;margin-bottom:18px">
-    <input class="form-input" id="maint-clean-interval" type="number" min="1" max="90" value="${cleanInterval}" style="flex:1">
-    <button class="btn-secondary" id="btn-record-clean" style="flex-shrink:0">${t("maint.record_cleaning")}</button>
-  </div>
+      style="${cCol ? `color:${cCol}` : ""}"><span>${t("maint.days_unit")}</span>
+          <button type="button" class="btn-secondary maint-reset" id="btn-record-clean" title="${t("maint.record_cleaning")}" aria-label="${t("maint.record_cleaning")}"><span class="material-icons" aria-hidden="true">refresh</span></button>
+        </div>
+        <div class="maint-interval">
+          <label for="maint-clean-interval">${t("maint.clean_every_inline")}</label>
+          <input class="form-input" id="maint-clean-interval" type="number" min="1" max="90" value="${cleanInterval}"><span>${t("maint.days_unit")}</span>
+        </div>
+      </div>
+    </section>
 
   <div class="tab-section-heading">${t("maint.low_water")}</div>
   <div class="form-row">
@@ -1121,6 +1170,11 @@ async function _wireFeedSoundControls(device, selectEl) {
       statusEl.textContent = t("maint.pushing");
       try {
         await api("POST", `/api/devices/${device.serial}/push-audio`, { name });
+        if (device.device_type === "camera_feeder") {
+          _patchDevice(device.serial, { enableAudio: true });
+          const toggle = document.getElementById("sched-meal-call");
+          if (toggle) toggle.className = "toggle-switch sw-on";
+        }
         statusEl.textContent = t("maint.push_success");
       } catch(e) {
         statusEl.textContent = t("maint.push_failed", {error: e.message});
@@ -1241,8 +1295,14 @@ const _DAY_KEYS = ["time.day_mon","time.day_tue","time.day_wed","time.day_thu","
 function _DAYS() { return _DAY_KEYS.map(k => t(k)); }
 // repeatDay uses 1=Mon...6=Sat,7=Sun
 const _RDAY = [1,2,3,4,5,6,7];
+// Petlibro 1.3.70: new meals enable the call; received plans missing the
+// flag default to off. Both paths default to two total playback times.
+function _scheduleAudio(plan) {
+  return { enableAudio: plan ? (plan.enableAudio ?? false) : true, audioTimes: plan?.audioTimes ?? 2 };
+}
 
 function _schedDayLabel(repeatDay) {
+  repeatDay = [...new Set((repeatDay || []).filter(d => Number.isInteger(d) && d >= 1 && d <= 7))];
   if (!repeatDay || repeatDay.length === 0) return t("schedule.no_days");
   if (repeatDay.length === 7) return t("schedule.daily");
   const sorted = [...repeatDay].sort((a,b)=>a-b);
@@ -1389,15 +1449,16 @@ function buildScheduleTab(plans) {
     const skipped = _planSkipped(plan);
     const dayLabel = _schedDayLabel(plan.repeatDay);
     const portions = plan.grainNum || 1;
-    const sound = plan.enableAudio ? ` · ${t("schedule.sound_times", {n: plan.audioTimes||1})}` : "";
-    return `<div class="sched-row${enabled?"":' disabled'}" data-idx="${i}">
+    const audio = _scheduleAudio(plan);
+    const sound = audio.enableAudio ? ` · ${t("schedule.sound_times", {n: audio.audioTimes})}` : "";
+    return `<div class="ha-card sched-row${enabled?"":' disabled'}" data-idx="${i}">
       <div class="sched-time">${escHtml(fmtTime12(_utcToLocal(plan.executionTime||"00:00")))}</div>
       <div class="sched-meta">${escHtml(dayLabel)} · ${escHtml(fmtPortions(portions, _currentDevice?.calibrated_grams_per_portion, _currentDevice?.feed_unit))}${escHtml(sound)}${skipped ? ` · <span style="color:var(--pl-warning)">${t(_skipLabelKey(plan))}</span>` : ""}</div>
       <div class="sched-actions">
         ${skipped || _nextOccurrenceDayOffset(plan) !== null ? `<button class="sched-skip-btn" data-idx="${i}" title="${t(skipped ? "schedule.undo_skip" : "schedule.skip_today")}" style="background:none;border:1px solid ${skipped ? "var(--pl-warning)" : "var(--pl-border)"};border-radius:6px;cursor:pointer;padding:3px 8px;font-size:12px;line-height:1.2;color:${skipped ? "var(--pl-warning)" : "var(--pl-text)"}">${t(skipped ? "schedule.undo_btn" : "schedule.skip_btn")}</button>` : ""}
         <button class="sched-toggle${enabled?" on":""}" data-idx="${i}" title="${enabled?"Disable":"Enable"}"></button>
         <button class="sched-edit-btn" data-idx="${i}" title="Edit"><span class="material-icons">edit</span></button>
-        <button class="sched-del-btn" data-idx="${i}" title="Delete" style="background:none;border:none;cursor:pointer;padding:4px;color:var(--pl-danger,#e05252);font-size:16px;line-height:1;opacity:0.8">&#x2715;</button>
+          <button class="sched-del-btn" data-idx="${i}" title="Delete" aria-label="Delete schedule"><span class="material-icons" aria-hidden="true">close</span></button>
       </div>
     </div>`;
   }).join("");
@@ -1411,22 +1472,23 @@ function buildScheduleTab(plans) {
     <div class="form-row">
       <label>${t("schedule.days")}</label>
       <div class="day-chips" id="sf-days">
-        ${days.map((d,i)=>`<div class="day-chip on" data-rday="${_RDAY[i]}">${d}</div>`).join("")}
+        ${days.map((d,i)=>`<div class="day-chip" data-rday="${_RDAY[i]}">${d}</div>`).join("")}
       </div>
     </div>
     <div class="form-row">
-      <label>${t("schedule.portions")}</label>
-      <div class="portion-chips" id="sf-portions">
-        ${[1,2,3,4,5].map(n=>`<div class="portion-chip${n===1?" on":""}" data-n="${n}">${escHtml(fmtPortions(n, _currentDevice?.calibrated_grams_per_portion, _currentDevice?.feed_unit))}</div>`).join("")}
-      </div>
+      <label for="sf-portions">${t("schedule.portions")}</label>
+      <select class="form-input" id="sf-portions">
+        ${Array.from({length:48}, (_,i)=>i+1).map(n=>`<option value="${n}">${escHtml(fmtPortions(n, _currentDevice?.calibrated_grams_per_portion, _currentDevice?.feed_unit))}</option>`).join("")}
+      </select>
     </div>
-    <!-- TODO: Align scheduled feeding sound behavior and controls with the official PetLibro app. -->
     <div class="form-row" style="display:flex;align-items:center;gap:10px">
       <input type="checkbox" id="sf-sound" style="width:16px;height:16px;accent-color:var(--pl-accent);flex-shrink:0">
       <label for="sf-sound" style="margin:0;flex-shrink:0">${t("schedule.sound")}</label>
       <span id="sf-sound-times-wrap" style="display:flex;align-items:center;gap:6px;margin-left:6px">
-        <label style="margin:0;flex-shrink:0;font-size:12px;color:var(--pl-subtext)">×</label>
-        <input type="number" class="form-input" id="sf-sound-times" value="1" min="1" max="5" style="width:52px;padding:4px 8px">
+        <label for="sf-sound-times" style="margin:0;flex-shrink:0;font-size:12px;color:var(--pl-subtext)">${t("schedule.sound_repetitions")}</label>
+        <select class="form-input" id="sf-sound-times" style="width:60px;padding:4px 8px">
+          ${[1,2,3,4,5].map(n => `<option value="${n}"${n === 2 ? " selected" : ""}>${n}</option>`).join("")}
+        </select>
       </span>
     </div>
     <div style="display:flex;gap:8px;margin-top:12px">
@@ -1454,7 +1516,14 @@ function buildScheduleTab(plans) {
       <button class="btn-secondary" id="btn-calibrate-feed" style="flex:1">${t("maint.calibrate_feed")}</button>
       ${_currentDevice.calibrated_grams_per_portion ? `<button class="btn-secondary" id="btn-reset-feed-calibration" style="flex-shrink:0;color:var(--pl-danger)">${t("maint.reset_calibration")}</button>` : ""}
     </div>` : "";
+  const mealCall = _currentDevice?.device_type === "camera_feeder" ? `
+    <div class="toggle-row">
+      <span class="toggle-label">${t("schedule.meal_call")}</span>
+      <button class="toggle-switch ${_currentDevice.enableAudio ? "sw-on" : "sw-off"}" id="sched-meal-call"></button>
+    </div>
+    <p class="form-hint">${t("schedule.meal_call_hint")}</p>` : "";
   const audioSection = (_currentDevice?.device_type === "one_rfid" || _currentDevice?.device_type === "granary" || _currentDevice?.device_type === "camera_feeder") ? `
+    ${mealCall}
     <div class="tab-section-heading" style="margin-top:18px">${t("maint.feed_sounds")}</div>
     <p class="form-hint">${t("maint.feed_sounds_hint")}</p>
     <div class="feed-sound-controls">
@@ -1504,6 +1573,20 @@ function wireScheduleTabHandlers() {
   const audioSelect = document.getElementById("maint-audio-select");
   if (audioSelect) _wireFeedSoundControls(_currentDevice, audioSelect);
 
+  const mealCall = document.getElementById("sched-meal-call");
+  if (mealCall) {
+    mealCall.onclick = async () => {
+      const enabled = !mealCall.classList.contains("sw-on");
+      mealCall.disabled = true;
+      try {
+        await api("POST", `/api/devices/${_currentDevice.serial}/command`, { enableAudio: enabled });
+        _patchDevice(_currentDevice.serial, { enableAudio: enabled });
+        mealCall.className = `toggle-switch ${enabled ? "sw-on" : "sw-off"}`;
+      } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
+      finally { mealCall.disabled = false; }
+    };
+  }
+
   const runAll = document.getElementById("sched-run-all");
   if (runAll) {
     runAll.onclick = async () => {
@@ -1541,17 +1624,16 @@ function wireScheduleTabHandlers() {
     document.getElementById("sf-time").value = plan ? _utcToLocal(plan.executionTime || "08:00") : "08:00";
     document.getElementById("sf-edit-idx").value = idx >= 0 ? idx : "";
     // Days
-    const rdays = new Set(plan?.repeatDay || _RDAY);
+    const rdays = new Set(plan?.repeatDay ?? []);
     document.querySelectorAll(".day-chip").forEach(c => c.classList.toggle("on", rdays.has(+c.dataset.rday)));
     // Portions
     const portions = plan?.grainNum || 1;
-    document.querySelectorAll(".portion-chip").forEach(c => c.classList.toggle("on", +c.dataset.n === portions));
-    // Sound — new plans default to on (matches feeder factory default)
-    const soundOn = plan ? (plan.enableAudio ?? true) : true;
+    document.getElementById("sf-portions").value = String(portions);
+    const audio = _scheduleAudio(plan);
     const soundCheck = document.getElementById("sf-sound");
-    soundCheck.checked = soundOn;
-    document.getElementById("sf-sound-times").value = plan?.audioTimes ?? 1;
-    document.getElementById("sf-sound-times-wrap").style.display = soundOn ? "flex" : "none";
+    soundCheck.checked = audio.enableAudio;
+    document.getElementById("sf-sound-times").value = audio.audioTimes;
+    document.getElementById("sf-sound-times-wrap").style.display = audio.enableAudio ? "flex" : "none";
     // Timezone hint
     const tzHint = document.getElementById("sf-tz-hint");
     if (tzHint) {
@@ -1606,8 +1688,9 @@ function wireScheduleTabHandlers() {
     });
   }
 
-  // Sound checkbox toggles the ×N input
+  // Hiding the playback count retains the selection for when sound is enabled again.
   document.getElementById("sf-sound").addEventListener("change", e => {
+    document.getElementById("sf-sound-times").setCustomValidity("");
     document.getElementById("sf-sound-times-wrap").style.display = e.target.checked ? "flex" : "none";
   });
 
@@ -1615,14 +1698,6 @@ function wireScheduleTabHandlers() {
   form.querySelectorAll(".day-chip").forEach(c => {
     c.onclick = () => c.classList.toggle("on");
   });
-  // Portion chip select
-  form.querySelectorAll(".portion-chip").forEach(c => {
-    c.onclick = () => {
-      form.querySelectorAll(".portion-chip").forEach(x => x.classList.remove("on"));
-      c.classList.add("on");
-    };
-  });
-
   document.getElementById("sched-add-btn").onclick = () => openForm(-1);
   document.getElementById("sf-cancel").onclick = closeForm;
 
@@ -1631,22 +1706,34 @@ function wireScheduleTabHandlers() {
     if (!time) { alert(t("schedule.err_no_time")); return; }
     const repeatDay = Array.from(form.querySelectorAll(".day-chip.on")).map(c => +c.dataset.rday);
     if (repeatDay.length === 0) { alert(t("schedule.err_no_days")); return; }
-    const grainNum = +form.querySelector(".portion-chip.on")?.dataset.n || 1;
-    const enableAudio = document.getElementById("sf-sound").checked;
-    const audioTimes = +document.getElementById("sf-sound-times").value || 1;
     const editIdx = document.getElementById("sf-edit-idx").value;
+    const existing = editIdx !== "" ? _schedPlans[+editIdx] : null;
+    const grainNum = Number(document.getElementById("sf-portions").value);
+    if (!Number.isInteger(grainNum) || grainNum < 1 || grainNum > 48) {
+      alert(t("schedule.err_portions"));
+      return;
+    }
+    const enableAudio = document.getElementById("sf-sound").checked;
+    const soundTimesInput = document.getElementById("sf-sound-times");
+    const audioTimes = Number(soundTimesInput.value);
+    if (enableAudio && (!Number.isInteger(audioTimes) || audioTimes < 1 || audioTimes > 5)) {
+      soundTimesInput.setCustomValidity(t("schedule.err_sound_repetitions"));
+      soundTimesInput.reportValidity();
+      return;
+    }
+    soundTimesInput.setCustomValidity("");
     const previousPlans = _schedPlans.map(plan => ({...plan}));
     const planData = {
-      planId: editIdx !== "" ? _schedPlans[+editIdx].planId : (5000000 + Math.floor(Math.random() * 1000000)),
+      ...existing,
+      planId: existing ? existing.planId : (5000000 + Math.floor(Math.random() * 1000000)),
       executionTime: _localToUtc(time),
       repeatDay,
       enableAudio,
-      audioTimes,
+      audioTimes: enableAudio ? audioTimes : (Number.isInteger(audioTimes) && audioTimes >= 1 && audioTimes <= 5 ? audioTimes : _scheduleAudio(existing).audioTimes),
       grainNum,
       syncTime: Date.now(),
-      _enabled: editIdx !== "" ? (_schedPlans[+editIdx]._enabled !== false) : true,
+      _enabled: existing ? (existing._enabled !== false) : true,
     };
-    if (editIdx !== "" && _schedPlans[+editIdx].skipEndTime) planData.skipEndTime = _schedPlans[+editIdx].skipEndTime;
     if (editIdx !== "") {
       _schedPlans[+editIdx] = planData;
     } else {
@@ -1861,7 +1948,7 @@ function wireDeviceTabHandlers(tabName) {
     const sound = document.getElementById("camera-live-sound");
     const controls = document.getElementById("camera-live-controls");
     const stop = document.getElementById("camera-live-stop");
-    const showStopControl = _settings.camera_preload_live_feeds !== true;
+    const showStopControl = (_settings.camera_stream_lifetime || (_settings.camera_preload_live_feeds === true ? "web_interface" : "viewing")) === "viewing";
     const snapshot = document.getElementById("camera-live-snapshot");
     const record = document.getElementById("camera-live-record");
     const fullscreen = document.getElementById("camera-live-fullscreen");
@@ -1913,7 +2000,7 @@ function wireDeviceTabHandlers(tabName) {
     if (fullscreen) fullscreen.onclick = async event => {
       event.preventDefault();
       event.stopPropagation();
-      if (document.fullscreenElement === frame || _liveCameraFullscreenFallback) {
+      if (cameraFullscreenElement() === frame || _liveCameraFullscreenFallback) {
         exitLiveCameraFullscreen();
         return;
       }
@@ -2001,7 +2088,7 @@ function wireDeviceTabHandlers(tabName) {
       const generation = ++_liveCameraGeneration;
       const current = () => generation === _liveCameraGeneration;
       const powerWithLiveView = d.camera_power_with_live_view === true;
-      if (_settings.camera_preload_live_feeds === true) {
+      if ((_settings.camera_stream_lifetime || (_settings.camera_preload_live_feeds === true ? "web_interface" : "viewing")) !== "viewing" || _settings.feeder_card_display === "live") {
         const background = getBackgroundCamera(d.serial);
         if (background) {
           start.disabled = true;
@@ -2017,11 +2104,11 @@ function wireDeviceTabHandlers(tabName) {
             if (snapshotImage) snapshotImage.hidden = true;
             if (placeholder) placeholder.style.display = "none";
             if (stop) stop.hidden = !showStopControl;
-            if (sound) sound.hidden = !!background.bridge;
+            if (sound) sound.hidden = false;
             const vp8Hint = document.getElementById("camera-windows-vp8-hint");
             if (vp8Hint) vp8Hint.hidden = !!background.bridge || _settings.camera_vp8_transcoding === true;
             setSoundState(background.video.muted);
-            status.textContent = background.bridge ? "Live via Home Assistant" : "Live";
+            status.textContent = "Live";
             start.disabled = false;
             muteCameraForTalk();
             return;
@@ -2063,7 +2150,7 @@ function wireDeviceTabHandlers(tabName) {
       }
       const video = document.createElement("video");
       video.autoplay = true; video.playsInline = true; video.muted = true;
-      video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain";
+      video.className = "camera-video";
       if (placeholder) placeholder.style.display = "none";
       frame.prepend(video);
       try {
@@ -2139,7 +2226,10 @@ function wireDeviceTabHandlers(tabName) {
             frame.classList.add("is-live");
           frame.classList.remove("is-connecting");
           if (snapshotImage) snapshotImage.hidden = true;
-            status.textContent = "Live via Home Assistant";
+            status.textContent = "Live";
+            if (sound) sound.hidden = false;
+            setSoundState(bridge.video.muted);
+            muteCameraForTalk();
             if (stop) stop.hidden = !showStopControl;
             start.disabled = false;
             return;
@@ -2153,7 +2243,7 @@ function wireDeviceTabHandlers(tabName) {
         status.textContent = error.message || "Camera stream unavailable";
       }
     };
-    if (_settings.camera_auto_start_live_view === true) start?.click();
+    if (_settings.camera_auto_start_live_view === true || _settings.camera_stream_lifetime === "home_assistant") start?.click();
   }
   if (tabName === "sensors" || (tabName === "overview" && d.device_type === "camera_feeder")) {
     const status = document.getElementById("camera-settings-status");
@@ -2679,8 +2769,8 @@ function wireDeviceTabHandlers(tabName) {
         const now = Date.now();
         await api("POST", `/api/devices/${d.serial}`, { last_food_refill_ts: now, food_refill_interval_days: interval });
         _patchDevice(d.serial, { last_food_refill_ts: now, food_refill_interval_days: interval });
-        recordFoodRefill.textContent = t("maint.recorded");
-        setTimeout(() => { recordFoodRefill.textContent = t("maint.record_food_refill"); renderDeviceTab("maintenance"); }, 1200);
+        recordFoodRefill.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
+        setTimeout(() => { renderDeviceTab("maintenance"); }, 1200);
       };
     }
     const resetDesiccant = document.getElementById("btn-reset-desiccant");
@@ -2690,8 +2780,8 @@ function wireDeviceTabHandlers(tabName) {
         const now = Date.now();
         await api("POST", `/api/devices/${d.serial}`, { last_desiccant_ts: now, desiccant_life_days: lifeDays });
         _patchDevice(d.serial, { last_desiccant_ts: now, desiccant_life_days: lifeDays });
-        resetDesiccant.textContent = t("maint.reset");
-        setTimeout(() => { resetDesiccant.textContent = t("maint.reset_desiccant"); renderDeviceTab("maintenance"); }, 1200);
+        resetDesiccant.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
+        setTimeout(() => { renderDeviceTab("maintenance"); }, 1200);
       };
     }
     const recordBowl = document.getElementById("btn-record-bowl");
@@ -2701,8 +2791,8 @@ function wireDeviceTabHandlers(tabName) {
         const now = Date.now();
         await api("POST", `/api/devices/${d.serial}`, { last_bowl_cleaned_ts: now, bowl_cleaning_interval_days: interval });
         _patchDevice(d.serial, { last_bowl_cleaned_ts: now, bowl_cleaning_interval_days: interval });
-        recordBowl.textContent = t("maint.recorded");
-        setTimeout(() => { recordBowl.textContent = t("maint.record_bowl"); renderDeviceTab("maintenance"); }, 1200);
+        recordBowl.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
+        setTimeout(() => { renderDeviceTab("maintenance"); }, 1200);
       };
     }
     const recordHousing = document.getElementById("btn-record-housing");
@@ -2712,8 +2802,8 @@ function wireDeviceTabHandlers(tabName) {
         const now = Date.now();
         await api("POST", `/api/devices/${d.serial}`, { last_housing_cleaned_ts: now, housing_cleaning_interval_days: interval });
         _patchDevice(d.serial, { last_housing_cleaned_ts: now, housing_cleaning_interval_days: interval });
-        recordHousing.textContent = t("maint.recorded");
-        setTimeout(() => { recordHousing.textContent = t("maint.record_housing"); renderDeviceTab("maintenance"); }, 1200);
+        recordHousing.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
+        setTimeout(() => { renderDeviceTab("maintenance"); }, 1200);
       };
     }
 
@@ -2786,9 +2876,8 @@ function wireDeviceTabHandlers(tabName) {
         try {
           await api("POST", `/api/devices/${d.serial}/command`, { filterNextReplacementTimestamp: newTs });
           _patchDevice(d.serial, { filterNextReplacementTimestamp: newTs, filter_life_days: lifeDays });
-          resetFilter.textContent = t("maint.reset");
+          resetFilter.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
           setTimeout(() => {
-            resetFilter.textContent = t("maint.reset_filter");
             renderDeviceTab("maintenance");
           }, 1200);
         } catch(e) { alert(t("overview.cmd_failed", {error: e.message})); }
@@ -2800,9 +2889,8 @@ function wireDeviceTabHandlers(tabName) {
         const now = Date.now();
         await api("POST", `/api/devices/${d.serial}`, { last_cleaned_ts: now, cleaning_interval_days: cleanInterval });
         _patchDevice(d.serial, { last_cleaned_ts: now, cleaning_interval_days: cleanInterval });
-        recordClean.textContent = t("maint.recorded");
+        recordClean.innerHTML = '<span class="material-icons" aria-hidden="true">check</span>';
         setTimeout(() => {
-          recordClean.textContent = t("maint.record_cleaning");
           renderDeviceTab("maintenance");
         }, 1200);
       };

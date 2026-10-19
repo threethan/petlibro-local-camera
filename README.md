@@ -94,6 +94,7 @@ The full list, with details, is in [Features](docs/features.md). In short:
 - **Fountains:** live water level, filter countdown, drink log, pump, light and light schedule controls
 - **Feeders:** Feed Now, lid control, backup battery status, last fed and next meal, maintenance reminders for the food tank, desiccant, bowl and housing
 - **PLAF203 camera:** Home Assistant Camera entity with direct-LAN JPEG snapshots while the feeder camera is enabled
+- **SD recordings:** a Recordings tab with a date timeline, feeding/motion/sound filters, and local playback, pause, seeking, snapshots and fullscreen. General settings can hide the Recordings or Pets tab. The APK-derived playback bridge is experimental; see [SD recording details](docs/sd-card-video-retrieval.md).
 - **Feeding schedules:** edit meals in the app, pause every schedule at once, or skip a plan's next feeding
 - **Feed amounts:** show portions as cups, ounces, grams or milliliters, with an optional calibration for your food
 - **Sound and LED (One RFID):** Device Sound hours, LED display hours, scrolling text, your own icons, built-in and custom LED animations with an animation editor, and custom feed sounds
@@ -101,7 +102,7 @@ The full list, with details, is in [Features](docs/features.md). In short:
 - **Notifications:** in-app bell, Home Assistant notifications, email, and mobile push through the Home Assistant Companion app
 - **Clock care:** feeders have no clock that survives a reboot, so Petlibro Local notices a wrong clock and corrects it without skipping or repeating a feeding
 - **Home Assistant:** entities for everything, so automations, dashboards and voice assistants work. See [Home Assistant entities](docs/entities.md)
-- **Dashboard status card:** an optional HACS Community card for Granary and Smart Camera Feeders, with camera, food and feeding status plus Feed Now. Add it from **Add card → Community → Petlibro Local Status Card** after installing it as a HACS Dashboard repository; details are in [Home Assistant entities](docs/entities.md#petlibro-local-status-card)
+- **Dashboard cards:** the bundled camera integration adds a Live Camera card using the app's Status player and a Status Card with food and feeding status plus Feed Now. Refresh Home Assistant and use **Add card → Petlibro Local Live Camera** or **Petlibro Local Status Card**. HACS/manual installation is also supported; see [Home Assistant entities](docs/entities.md#petlibro-local-status-card).
 
 ---
 
@@ -191,6 +192,15 @@ Petlibro firmware appears to cache the cloud broker's IP address and falls back 
 ### Restarting Mosquitto Reboots Your Devices
 
 In my testing, every time the Mosquitto broker restarts, the feeders and fountains reboot themselves and reconnect within a minute or two. That is firmware behavior, not something this app controls. Avoid restarting Mosquitto (or adding or removing a device here, which restarts it) near a feeding time. Restarting Home Assistant or Petlibro Local did not reboot my feeder. The full explanation, including what happens to the feeder's clock, is in [Networking](docs/networking.md#restarting-mosquitto-reboots-your-devices).
+
+### Set up new device (Experimental)
+
+Choose **Add Device → Set up new device** to send Wi-Fi settings using the HA
+host's Bluetooth adapter, then automatically capture MQTT credentials through
+the existing Auto Setup path. Rebuild the add-on for Bluetooth support. This
+requires a local adapter and does not use remote Bluetooth proxies. Hardware
+validation and factory-fresh activation remain pending; see
+[provisioning instructions and APK findings](docs/device-provisioning.md).
 
 ### Auto Setup (Recommended)
 

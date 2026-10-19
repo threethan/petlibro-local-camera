@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-test('preload connects online camera feeders once and releases them when disabled', async () => {
+for (const mode of ['preload', 'cards', 'web_interface', 'home_assistant']) test(`${mode} connects online camera feeders once and releases them when disabled`, async () => {
   const requests = [];
   const videos = [];
   const scope = vm.createContext({
     BASE: '',
-    _settings: { camera_preload_live_feeds: true },
+    _settings: { camera_preload_live_feeds: mode === 'preload', camera_stream_lifetime: ['web_interface', 'home_assistant'].includes(mode) ? mode : undefined, feeder_card_display: mode === 'cards' ? 'live' : 'product' },
     _devices: [
       { serial: 'camera-1', device_type: 'camera_feeder', online: true },
       { serial: 'camera-2', device_type: 'camera_feeder', online: false },
@@ -17,6 +17,7 @@ test('preload connects online camera feeders once and releases them when disable
     _liveCameraBackgroundSerial: null,
     document: {
       body: { append() {} },
+      querySelectorAll() { return []; },
       createElement(tag) {
         if (tag === 'div') return { style: {}, setAttribute() {}, append() {}, prepend() {} };
         const video = { readyState: 2, style: {}, play: async () => {}, pause() {}, remove() {} };
@@ -55,7 +56,7 @@ test('preload connects online camera feeders once and releases them when disable
   assert.equal(videos.length, 1);
   vm.runInContext('syncBackgroundCameras()', scope);
   assert.equal(videos.length, 1);
-  vm.runInContext('_settings.camera_preload_live_feeds = false; syncBackgroundCameras()', scope);
+  vm.runInContext('_settings.camera_stream_lifetime = "viewing"; _settings.camera_preload_live_feeds = false; _settings.feeder_card_display = "product"; syncBackgroundCameras()', scope);
   assert.equal(vm.runInContext('getBackgroundCamera("camera-1")', scope), null);
   assert.deepEqual(requests.map(([url, method]) => method), ['POST', 'DELETE']);
 });

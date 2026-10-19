@@ -92,6 +92,42 @@ Entity IDs are stable and based on the device serial number, so they survive dev
 
 ## Petlibro Local Status Card
 
+### Live Camera dashboard card
+
+The same JavaScript resource also provides **Petlibro Local Live Camera** in
+the dashboard card picker. This card embeds the app's Status-tab video player,
+including sound, talk, snapshot download, recording, resolution, night vision,
+and fullscreen controls. Each card opens only its selected camera.
+
+The bundled Petlibro Camera integration registers these cards automatically.
+For installations without that integration, add
+`/local/petlibro-local-status-card.js` as a JavaScript module resource after
+copying `dist/petlibro-local-status-card.js` from this repository into Home
+Assistant's `www` directory, or use the existing
+HACS resource. Refresh the browser, choose
+**Add card → Petlibro Local Live Camera**, and select a **Snapshot camera**
+or **Live camera** using the entity pickers. Live camera selection automatically
+finds the feeder; a manual serial is only an optional advanced fallback.
+Selecting only a snapshot camera shows periodically refreshed still images
+without starting a live connection. Selecting a live camera uses the app's
+full player. The Status Card uses this exact same camera view and keeps it
+mounted while sensor values update. The local add-on slug defaults
+to `local_petlibro_local`; change it if your installation uses a different slug.
+The card uses an authenticated Home Assistant ingress session and requires
+access to the add-on through Supervisor. Microphone permission is requested
+only when using Talk.
+
+```yaml
+type: custom:petlibro-local-live-camera-card
+live_camera_entity: camera.your_feeder_live_camera
+name: Feeder camera
+```
+
+Removing the card closes its viewer; the server's always-on relay continues
+according to the app's stream-lifetime setting.
+
+### Status card
+
 The optional **Petlibro Local Status Card** is a Community dashboard card for
 Granary and Smart Camera Feeders. It mirrors the app's status view: camera,
 food status, battery, last feed, next meal, and a **Feed now** action. Speaker
@@ -100,9 +136,10 @@ and indicator-light controls are deliberately not included.
 Install `Petlibro Local Status Card` from HACS as a **Dashboard** repository,
 then refresh the browser. In a dashboard, select **Add card → Community →
 Petlibro Local Status Card**. Its visual editor asks for the feeder's **Feed
-Now** button and, optionally, its snapshot and Live Camera entities. When a
-Live Camera entity is selected, the last snapshot remains visible with a
-connecting spinner until the live image arrives. The card derives the other
+Now** button and, optionally, its snapshot and Live Camera entities. Live
+video uses the same player and controls as the standalone Live Camera card.
+Snapshot-only selections show a periodically refreshed still image.
+The card derives the other
 entities from the selected button, so it works even if you rename the feeder.
 
 The card needs Petlibro Local 2026.10.8 or later for the Food Status sensor.

@@ -15,6 +15,8 @@ _RTSP_URL = "rtsp://127.0.0.1:8554/device/{serial}"
 _GO2RTC_API = "http://127.0.0.1:11984"
 _HA_RTSP_HOST = "172.30.32.1"
 _HA_RTSP_PORT = 18556
+_INTERNAL_RTSP_HOST = "127.0.0.1"
+_INTERNAL_RTSP_PORT = 18556
 _GO2RTC_WEBRTC = f"{_GO2RTC_API}/api/webrtc?src={{serial}}"
 _SNAPSHOT_INTERVAL_SECS = 5
 _SNAPSHOTS_ENABLED = False
@@ -26,15 +28,21 @@ _UID_RE = re.compile(r"^[!-~]{20}$")
 _http: aiohttp.ClientSession | None = None
 _bridge_process: asyncio.subprocess.Process | None = None
 _tasks: dict[str, asyncio.Task] = {}
+_keep_open_tasks: dict[str, asyncio.Task] = {}
 _snapshots: dict[str, bytes] = {}
 _registered_uids: dict[str, str] = {}
 _live_exposed: set[str] = set()
 _camera_available: dict[str, bool] = {}
+_snapshot_available: dict[str, bool] = {}
+_live_available: dict[str, bool] = {}
+_stream_sources: dict[str, tuple[str, ...]] = {}
+_stream_locks: dict[str, asyncio.Lock] = {}
 _live_serial: str | None = None
 _live_process: asyncio.subprocess.Process | None = None
 _go2rtc_process: asyncio.subprocess.Process | None = None
-_rtsp_loopback_server: asyncio.Server | None = None
-_rtsp_loopback_tasks: set[asyncio.Task] = set()
+_ha_rtsp_server: asyncio.Server | None = None
+_ha_rtsp_tasks: set[asyncio.Task] = set()
+_ha_rtsp_lock = asyncio.Lock()
 _webrtc_sessions: dict[str, str] = {}
 
 
@@ -107,7 +115,7 @@ async def live_frames(serial: str):
 
 
 async def live_video_chunks(serial: str):
-    """Yield fragmented H.264 MP4 for one temporary ingress viewer."""
+    """Yield fragmented H.264/AAC MP4 for one temporary ingress viewer."""
     global _live_serial, _live_process
     if not live_stream_available(serial):
         raise RuntimeError("Camera is not registered or the live viewer is busy")
@@ -119,10 +127,13 @@ async def live_video_chunks(serial: str):
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-rtsp_transport", "tcp", "-i", _RTSP_URL.format(serial=serial),
-            "-an", "-vf", "fps=15,scale='min(960,iw)':-2",
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", "fps=15,scale='min(960,iw)':-2",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
             "-profile:v", "baseline", "-level:v", "3.1", "-pix_fmt", "yuv420p",
             "-g", "15", "-bf", "0", "-sc_threshold", "0",
+            "-c:a", "aac", "-profile:a", "aac_low", "-ar", "44100",
+            "-ac", "1", "-b:a", "64k",
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
@@ -153,6 +164,8 @@ async def live_video_chunks(serial: str):
 
 async def start_bridge() -> bool:
     """Start the pinned camera bridge, bound to loopback only."""
+    import storage
+
     global _http, _bridge_process, _go2rtc_process
     if _http is None or _http.closed:
         _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
@@ -165,6 +178,7 @@ async def start_bridge() -> bool:
                     "CAMERA_BRIDGE_LISTEN_ADDR": "127.0.0.1:8081",
                     "PETLIBRO_CAMERA_MEDIA_RTSP_LISTEN_ADDR": "127.0.0.1:8554",
                     "PETLIBRO_CAMERA_IDLE_TIMEOUT_SECONDS": "10",
+                    "PETLIBRO_CAMERA_H264_STARTUP_FIX": "true" if storage.get_settings().get("camera_h264_startup_fix", True) is True else "false",
                     "PETLIBRO_CAMERA_DISCOVERY_BROADCAST_FALLBACK": "true",
                 },
             )
@@ -193,10 +207,10 @@ async def start_bridge() -> bool:
     return False
 
 
-async def _forward_rtsp_loopback(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Forward go2rtc's FFmpeg callback to its Supervisor-only RTSP socket."""
+async def _forward_ha_rtsp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Relay a Home Assistant client to go2rtc's private RTSP listener."""
     task = asyncio.current_task()
-    _rtsp_loopback_tasks.add(task)
+    _ha_rtsp_tasks.add(task)
     upstream_writer = None
     pumps = []
 
@@ -207,7 +221,7 @@ async def _forward_rtsp_loopback(reader: asyncio.StreamReader, writer: asyncio.S
 
     try:
         upstream_reader, upstream_writer = await asyncio.wait_for(
-            asyncio.open_connection(_HA_RTSP_HOST, _HA_RTSP_PORT), timeout=5,
+            asyncio.open_connection(_INTERNAL_RTSP_HOST, _INTERNAL_RTSP_PORT), timeout=5,
         )
         pumps = [
             asyncio.create_task(copy(reader, upstream_writer)),
@@ -215,7 +229,7 @@ async def _forward_rtsp_loopback(reader: asyncio.StreamReader, writer: asyncio.S
         ]
         await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
     except (OSError, asyncio.TimeoutError):
-        _LOGGER.warning("Could not connect FFmpeg to go2rtc's RTSP listener", exc_info=True)
+        _LOGGER.warning("Could not connect HA camera relay to go2rtc", exc_info=True)
     finally:
         for pump in pumps:
             pump.cancel()
@@ -224,33 +238,35 @@ async def _forward_rtsp_loopback(reader: asyncio.StreamReader, writer: asyncio.S
         for connection in writers:
             connection.close()
         await asyncio.gather(*(connection.wait_closed() for connection in writers), return_exceptions=True)
-        _rtsp_loopback_tasks.discard(task)
+        _ha_rtsp_tasks.discard(task)
 
 
-async def _stop_rtsp_loopback() -> None:
-    global _rtsp_loopback_server
-    server = _rtsp_loopback_server
-    _rtsp_loopback_server = None
+async def _start_ha_rtsp() -> None:
+    global _ha_rtsp_server
+    if _ha_rtsp_server is None:
+        _ha_rtsp_server = await asyncio.start_server(_forward_ha_rtsp, _HA_RTSP_HOST, _HA_RTSP_PORT)
+        _LOGGER.info("Home Assistant camera relay started")
+
+
+async def _stop_ha_rtsp() -> None:
+    global _ha_rtsp_server
+    server = _ha_rtsp_server
+    _ha_rtsp_server = None
     if server is not None:
         server.close()
-    tasks = list(_rtsp_loopback_tasks)
+    tasks = list(_ha_rtsp_tasks)
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     if server is not None:
         await server.wait_closed()
+        _LOGGER.info("Home Assistant camera relay stopped")
 
 
 async def _start_go2rtc() -> None:
     global _go2rtc_process
-    global _rtsp_loopback_server
-    # go2rtc's exec producer always publishes FFmpeg output to 127.0.0.1.
-    # Keep the main listener restricted to the Supervisor interface and
-    # provide that internal callback without binding RTSP on LAN interfaces.
-    if _rtsp_loopback_server is None:
-        _rtsp_loopback_server = await asyncio.start_server(
-            _forward_rtsp_loopback, "127.0.0.1", _HA_RTSP_PORT,
-        )
+    # App viewers, FFmpeg callbacks and background consumers stay on loopback.
+    # The separate Supervisor-facing relay exists only for exposed cameras.
     if _go2rtc_process is not None and _go2rtc_process.returncode is None:
         return
     config = "/data/go2rtc.yaml"
@@ -259,7 +275,7 @@ async def _start_go2rtc() -> None:
             'api:\n'
             '  listen: "127.0.0.1:11984"\n'
             'rtsp:\n'
-            '  listen: "172.30.32.1:18556"\n'
+            '  listen: "127.0.0.1:18556"\n'
             'webrtc:\n'
             '  listen: ":18555"\n'
             'ffmpeg:\n'
@@ -289,35 +305,43 @@ async def _start_go2rtc() -> None:
     raise RuntimeError("go2rtc did not become healthy")
 
 
-async def exchange_webrtc(serial: str, offer: bytes) -> tuple[bytes, str | None]:
-    if serial not in _registered_uids or _http is None:
-        raise RuntimeError("Camera is not registered")
-    stream_name = f"plaf203_{serial}"
+async def _ensure_live_stream(serial: str) -> str:
+    """Reuse running producers; PUT replaces a go2rtc stream and makes it cold."""
     import storage
 
-    settings = storage.get_settings()
-    # go2rtc picks the first source compatible with the browser's offered
-    # codecs. Put VP8 first so enabling the setting actually selects it.
-    sources = _live_stream_sources(
-        serial, settings.get("camera_vp8_transcoding", False) is True,
-    )
-    params = [("name", stream_name)]
-    params.extend(("src", source) for source in sources)
-    async with _http.put(
-        f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
-    ) as response:
-        registration_status = response.status
-        registration_detail = (await response.text())[:300] if registration_status >= 400 else ""
-    # go2rtc may report a config persistence error after adding the stream to
-    # memory (for example with a read-only config). Match the relay: the live
-    # stream list determines whether registration succeeded.
-    async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
-        if response.status != 200:
-            raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
-        streams = await response.json()
-    if not isinstance(streams, dict) or stream_name not in streams:
-        detail = f": {registration_detail}" if registration_detail else ""
-        raise RuntimeError(f"go2rtc did not register camera stream (HTTP {registration_status}){detail}")
+    stream_name = f"plaf203_{serial}"
+    sources = tuple(_live_stream_sources(
+        serial, storage.get_settings().get("camera_vp8_transcoding", False) is True,
+    ))
+    async with _stream_locks.setdefault(serial, asyncio.Lock()):
+        async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
+            if response.status != 200:
+                raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
+            streams = await response.json()
+        if _stream_sources.get(serial) == sources and isinstance(streams, dict) and stream_name in streams:
+            return stream_name
+        params = [("name", stream_name)]
+        params.extend(("src", source) for source in sources)
+        async with _http.put(
+            f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
+        ) as response:
+            status = response.status
+            detail = (await response.text())[:300] if status >= 400 else ""
+        # A config persistence error can follow successful in-memory registration.
+        async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
+            if response.status != 200:
+                raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
+            streams = await response.json()
+        if not isinstance(streams, dict) or stream_name not in streams:
+            raise RuntimeError(f"go2rtc did not register camera stream (HTTP {status}): {detail}")
+        _stream_sources[serial] = sources
+        return stream_name
+
+
+async def exchange_webrtc(serial: str, offer: bytes) -> tuple[bytes, str | None]:
+    if serial not in _registered_uids or _http is None:
+        raise RuntimeError("Camera is not registered - try again in a few minutes.")
+    stream_name = await _ensure_live_stream(serial)
     async with _http.post(
         _GO2RTC_WEBRTC.format(serial=quote(stream_name)), data=offer,
         headers={"Content-Type": "application/sdp"},
@@ -330,81 +354,55 @@ async def exchange_webrtc(serial: str, offer: bytes) -> tuple[bytes, str | None]
 
 
 async def set_live_exposure(serial: str, enabled: bool, config: dict, state: dict) -> None:
-    """Publish/remove the HA live camera and its on-demand RTSP source."""
+    """Publish/remove the HA entity independently of the shared relay."""
     if _http is None:
         raise RuntimeError("Camera bridge is not running")
     import ha_mqtt
-    stream_name = f"plaf203_{serial}"
-    if enabled:
-        if serial not in _registered_uids:
-            raise RuntimeError("Feeder camera is not online or enabled")
-        if serial in _live_exposed:
+    async with _ha_rtsp_lock:
+        stream_name = f"plaf203_{serial}"
+        if enabled:
+            if serial not in _registered_uids:
+                raise RuntimeError("Feeder camera is not online or enabled")
+            if serial in _live_exposed:
+                await _start_ha_rtsp()
+                return
+            await _ensure_live_stream(serial)
+            await _start_ha_rtsp()
+            try:
+                await ha_mqtt.publish_live_camera_discovery(
+                    serial, config, state, f"rtsp://{_HA_RTSP_HOST}:{_HA_RTSP_PORT}/{stream_name}"
+                )
+            except BaseException:
+                # Failed/cancelled registration must not leave an unused listener.
+                if not _live_exposed:
+                    await _stop_ha_rtsp()
+                raise
+            _live_exposed.add(serial)
+            if __import__("storage").get_settings().get("camera_stream_lifetime") != "home_assistant":
+                _live_available[serial] = True
+            await _publish_available(serial)
             return
-        sources = _live_stream_sources(
-            serial,
-            __import__("storage").get_settings().get("camera_vp8_transcoding", False) is True,
-        )
-        # Keep transcoded VP8 first; otherwise the earlier H.264 producer
-        # wins before go2rtc gets a chance to consider the VP8 track.
-        params = [("name", stream_name)]
-        params.extend(("src", source) for source in sources)
-        async with _http.put(
-            f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
-        ) as response:
-            registration_status = response.status
-            registration_detail = (await response.text())[:300] if registration_status >= 400 else ""
-        # go2rtc can add a stream to its in-memory registry and then return
-        # HTTP 400 when persisting the dynamic config fails. Match the WebRTC
-        # path above: verify the live registry before treating that response
-        # as a failed registration.
-        async with _http.get(f"{_GO2RTC_API}/api/streams") as response:
-            if response.status != 200:
-                raise RuntimeError(f"go2rtc stream check returned HTTP {response.status}")
-            streams = await response.json()
-        if not isinstance(streams, dict) or stream_name not in streams:
-            detail = f": {registration_detail}" if registration_detail else ""
-            raise RuntimeError(
-                f"Could not expose camera stream (HTTP {registration_status}){detail}"
-            )
-        try:
-            await ha_mqtt.publish_live_camera_discovery(
-                serial, config, state, f"rtsp://{_HA_RTSP_HOST}:{_HA_RTSP_PORT}/{stream_name}"
-            )
-        except Exception:
-            async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(stream_name)}"):
-                pass
-            raise
-        _live_exposed.add(serial)
-        return
 
-    await ha_mqtt.remove_live_camera_discovery(serial)
-    _live_exposed.discard(serial)
-    async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(stream_name)}") as response:
-        if response.status >= 400:
-            _LOGGER.warning("Could not remove go2rtc stream for %s... (HTTP %d)", serial[:6], response.status)
+        await ha_mqtt.remove_live_camera_discovery(serial)
+        _live_exposed.discard(serial)
+        if not _live_exposed:
+            await _stop_ha_rtsp()
+        if __import__("storage").get_settings().get("camera_stream_lifetime") != "home_assistant":
+            _live_available.pop(serial, None)
+        await _publish_available(serial)
+    # The app and background consumer still use this stream. Only stop_device
+    # removes its producer; withdrawing HA discovery must not interrupt it.
 
 
 async def refresh_live_exposures() -> None:
     """Re-register exposed streams after changing the transcoding setting."""
-    if _http is None or _http.closed or not _live_exposed:
+    serials = set(_live_exposed) | set(_keep_open_tasks)
+    if _http is None or _http.closed or not serials:
         return
-    import storage
-
-    enabled = storage.get_settings().get("camera_vp8_transcoding", False) is True
-    for serial in tuple(_live_exposed):
-        stream_name = f"plaf203_{serial}"
-        params = [("name", stream_name)]
-        params.extend(("src", source) for source in _live_stream_sources(serial, enabled))
+    for serial in serials:
         try:
-            async with _http.put(
-                f"{_GO2RTC_API}/api/streams?{urlencode(params)}"
-            ) as response:
-                if response.status >= 400:
-                    _LOGGER.warning(
-                        "Could not refresh live camera stream for %s... (HTTP %d): %s",
-                        serial[:6], response.status, (await response.text())[:300],
-                    )
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await _ensure_live_stream(serial)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError):
             _LOGGER.warning("Could not refresh live camera stream for %s...", serial[:6], exc_info=True)
 
 
@@ -422,7 +420,7 @@ async def close_webrtc(session_id: str) -> None:
 async def stop_bridge() -> None:
     """Stop snapshot tasks and the bridge during add-on shutdown."""
     global _http, _bridge_process, _go2rtc_process
-    for serial in list(_tasks):
+    for serial in set(_registered_uids) | set(_tasks) | set(_keep_open_tasks) | set(_live_exposed):
         await stop_device(serial)
     _registered_uids.clear()
     if _bridge_process and _bridge_process.returncode is None:
@@ -433,7 +431,7 @@ async def stop_bridge() -> None:
             _bridge_process.kill()
             await _bridge_process.wait()
     _bridge_process = None
-    await _stop_rtsp_loopback()
+    await _stop_ha_rtsp()
     if _go2rtc_process and _go2rtc_process.returncode is None:
         _go2rtc_process.terminate()
         try:
@@ -475,12 +473,12 @@ async def update_device(serial: str, uid: str, enabled: bool) -> None:
 
     import storage
     cfg = storage.get_devices().get(serial, {})
-    if cfg.get("live_camera_exposed") and serial not in _live_exposed:
-        try:
-            import devices
-            await set_live_exposure(serial, True, cfg, devices.get_device_state(serial))
-        except Exception:
-            _LOGGER.exception("Could not restore HA live camera exposure for %s...", serial[:6])
+    _start_keep_open(serial)
+    try:
+        import devices
+        await set_live_exposure(serial, bool(cfg.get("live_camera_exposed")), cfg, devices.get_device_state(serial))
+    except Exception:
+        _LOGGER.exception("Could not restore HA live camera exposure for %s...", serial[:6])
 
     if not _SNAPSHOTS_ENABLED:
         await _set_available(serial, False)
@@ -490,6 +488,113 @@ async def update_device(serial: str, uid: str, enabled: bool) -> None:
     if task is None or task.done():
         _LOGGER.info("Starting HA camera snapshots for %s...", serial[:6])
         _tasks[serial] = asyncio.create_task(_snapshot_loop(serial), name=f"camera-{serial}")
+
+
+def _start_keep_open(serial: str) -> None:
+    import storage
+
+    if storage.get_settings().get("camera_stream_lifetime") != "home_assistant":
+        return
+    task = _keep_open_tasks.get(serial)
+    if task is None or task.done():
+        _keep_open_tasks[serial] = asyncio.create_task(
+            _keep_open_loop(serial), name=f"camera-keep-open-{serial}"
+        )
+
+
+async def refresh_stream_lifetime() -> None:
+    """Apply stream lifetime changes immediately to all registered cameras."""
+    tasks = list(_keep_open_tasks.values())
+    _keep_open_tasks.clear()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    import storage
+    import devices
+
+    persistent = storage.get_settings().get("camera_stream_lifetime") == "home_assistant"
+    configs = storage.get_devices()
+    for serial in tuple(_registered_uids):
+        cfg = configs.get(serial, {})
+        if cfg.get("live_camera_exposed"):
+            if not persistent:
+                _live_available[serial] = True
+            try:
+                await set_live_exposure(serial, True, cfg, devices.get_device_state(serial))
+            except Exception:
+                _LOGGER.warning("Could not expose live camera for %s...", serial[:6], exc_info=True)
+        else:
+            await set_live_exposure(serial, False, cfg, devices.get_device_state(serial))
+        await _publish_available(serial)
+        _start_keep_open(serial)
+
+
+async def _keep_open_loop(serial: str) -> None:
+    """Keep the shared HA/WebRTC video and audio producers running."""
+    next_exposure_retry = 0.0
+    while True:
+        process = None
+        stderr_task = None
+        try:
+            import storage
+            import devices
+
+            cfg = storage.get_devices().get(serial, {})
+            if cfg.get("live_camera_exposed"):
+                try:
+                    await set_live_exposure(serial, True, cfg, devices.get_device_state(serial))
+                except Exception:
+                    _LOGGER.warning("Could not expose live camera for %s...; keeping relay running", serial[:6], exc_info=True)
+            await _ensure_live_stream(serial)
+            # Request both video codecs so HA's H.264 source stays warm even
+            # when browsers prefer VP8. Opus keeps browser audio ready too.
+            tracks = [("video", "h264"), ("audio", "opus"), ("audio", "aac")]
+            if storage.get_settings().get("camera_vp8_transcoding", False) is True:
+                tracks.insert(0, ("video", "vp8"))
+            source = f"rtsp://{_INTERNAL_RTSP_HOST}:{_INTERNAL_RTSP_PORT}/plaf203_{serial}?{urlencode(tracks)}"
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-rtsp_transport", "tcp", "-timeout", "15000000",
+                "-i", source,
+                "-map", "0:v", "-map", "0:a?", "-c", "copy",
+                "-progress", "pipe:1", "-f", "null", "-",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
+            while line := await asyncio.wait_for(
+                process.stdout.readline(), timeout=_STREAM_READ_TIMEOUT_SECS
+            ):
+                if line.startswith(b"frame="):
+                    frames = line.removeprefix(b"frame=").strip()
+                    if frames.isdigit() and int(frames) > 0:
+                        # MQTT can still be connecting when the private relay
+                        # starts. Retry HA exposure without restarting video.
+                        cfg = storage.get_devices().get(serial, {})
+                        now = asyncio.get_running_loop().time()
+                        if cfg.get("live_camera_exposed") and serial not in _live_exposed and now >= next_exposure_retry:
+                            next_exposure_retry = now + 5
+                            try:
+                                await set_live_exposure(serial, True, cfg, devices.get_device_state(serial))
+                            except Exception:
+                                _LOGGER.debug("HA camera exposure retry pending for %s...", serial[:6], exc_info=True)
+                        _live_available[serial] = True
+                        await _publish_available(serial)
+            _LOGGER.warning("Persistent camera stream ended for %s...; retrying", serial[:6])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Persistent camera stream failed for %s...; retrying", serial[:6], exc_info=True)
+        finally:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            if stderr_task:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+            _live_available[serial] = False
+            await _publish_available(serial)
+        await asyncio.sleep(5)
 
 
 async def set_snapshot_interval(seconds: int) -> None:
@@ -551,6 +656,10 @@ async def set_snapshots_enabled(enabled: bool) -> None:
 
 
 async def stop_device(serial: str) -> None:
+    keep_open_task = _keep_open_tasks.pop(serial, None)
+    if keep_open_task:
+        keep_open_task.cancel()
+        await asyncio.gather(keep_open_task, return_exceptions=True)
     if _live_serial == serial and _live_process and _live_process.returncode is None:
         _live_process.kill()
     task = _tasks.pop(serial, None)
@@ -559,13 +668,18 @@ async def stop_device(serial: str) -> None:
         await asyncio.gather(task, return_exceptions=True)
     _registered_uids.pop(serial, None)
     _snapshots.pop(serial, None)
+    _stream_sources.pop(serial, None)
+    _live_available.pop(serial, None)
     await _set_available(serial, False)
     try:
         import ha_mqtt
         await ha_mqtt.remove_live_camera_discovery(serial)
     except Exception:
         _LOGGER.debug("Could not retract live camera discovery for %s...", serial[:6], exc_info=True)
-    _live_exposed.discard(serial)
+    async with _ha_rtsp_lock:
+        _live_exposed.discard(serial)
+        if not _live_exposed:
+            await _stop_ha_rtsp()
     if _http and not _http.closed:
         try:
             async with _http.delete(f"{_GO2RTC_API}/api/streams?src={quote(f'plaf203_{serial}')}"):
@@ -674,6 +788,14 @@ async def _jpeg_frames(stream):
 
 
 async def _set_available(serial: str, available: bool) -> None:
+    _snapshot_available[serial] = available
+    await _publish_available(serial)
+
+
+async def _publish_available(serial: str) -> None:
+    # The native live camera shares the existing availability topic. Snapshot
+    # capture being disabled must not mark a healthy live stream offline.
+    available = bool(_snapshot_available.get(serial) or _live_available.get(serial))
     if _camera_available.get(serial) is available:
         return
     try:

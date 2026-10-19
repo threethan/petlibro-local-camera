@@ -15,9 +15,12 @@ from aiohttp import web
 import camera
 import camera_talk
 import devices
+import feed_audio
 import ha_api
 import mosquitto
 import mqtt_broker
+import provisioning
+import recordings
 import storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -28,12 +31,15 @@ VERSION = "2026.10.8"
 
 # Credential capture state
 _capture_state: dict = {"status": "idle", "result": {}}
+_capture_task = None
+_provision_devices = {}
+_provision_scanning = False
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _build_html(base: str) -> str:
-    with open("/app/index.html", "r") as f:
+def _build_html(base: str, template: str = "index.html") -> str:
+    with open(f"/app/{template}", "r") as f:
         template = f.read()
     return template.replace("{{BASE}}", base).replace("{{VERSION}}", VERSION)
 
@@ -70,8 +76,21 @@ async def handle_index(request):
     )
 
 
+async def handle_camera_view(request):
+    ingress_path = request.headers.get("X-Ingress-Path", "")
+    return web.Response(
+        text=_build_html(ingress_path, "camera-view.html"),
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def handle_icon(request):
     return web.FileResponse("/app/icon.png")
+
+
+async def handle_web_icon(request):
+    return web.FileResponse("/app/icon-red.png")
 
 
 async def handle_locale(request):
@@ -118,7 +137,9 @@ async def handle_audio_serve(request):
     # since every real PetLibro audioUrl we've captured ends in .aac and the
     # feeder's firmware may key off that when deciding how to fetch/decode it.
     stem = name[:-4] if name.lower().endswith(".aac") else name
-    for base_dir in ("/data/audio", "/app/audio"):
+    directories = (("/data/audio/feeding",) if request.path.startswith("/audio/feeding/")
+                   else ("/data/audio", "/app/audio"))
+    for base_dir in directories:
         path = f"{base_dir}/{stem}.aac"
         if os.path.exists(path):
             # aiohttp's normal access log is silenced (see logging setup at
@@ -232,15 +253,20 @@ async def handle_api_device_push_audio(request):
     if not any(os.path.exists(f"{d}/{name}.aac") for d in ("/data/audio", "/app/audio")):
         return web.Response(status=404, text="Sound not found")
 
-    audio_url = f"{base_url.rstrip('/')}/audio/{name}.aac"
-    ok = await devices.send_command(serial, {
-        "audioUrl": audio_url,
-        "enableAudio": True,
-        # The feeder protocol misspells this field; retain its exact spelling.
-        "soundRepititions": sound_repititions,
-    })
-    if not ok:
-        return web.Response(status=400, text="Failed to send command")
+    source = next(f"{d}/{name}.aac" for d in ("/data/audio", "/app/audio")
+                  if os.path.exists(f"{d}/{name}.aac"))
+    try:
+        if storage.get_devices().get(serial, {}).get("device_type") == "camera_feeder":
+            prepared = await feed_audio.prepare(source)
+            audio_url = f"{base_url.rstrip('/')}/audio/feeding/{prepared}"
+        else:
+            audio_url = f"{base_url.rstrip('/')}/audio/{name}.aac"
+        await feed_audio.check_download(audio_url)
+        await devices.set_feeding_audio(serial, {"audioUrl": audio_url, "enableAudio": True},
+                                        repetitions=sound_repititions)
+    except (ValueError, OSError, RuntimeError, asyncio.TimeoutError) as exc:
+        _LOGGER.warning("Feeding sound push failed: %s", type(exc).__name__)
+        return web.Response(status=400, text=str(exc) or "Feeder did not acknowledge the sound")
     return web.json_response({"status": "ok", "audio_url": audio_url})
 
 
@@ -475,6 +501,7 @@ async def handle_api_device_delete(request):
     mqtt_pass = deleted_cfg.get("mqtt_pass", "") if remove_creds else ""
 
     await camera_talk.stop_device(serial)
+    await recordings.stop_device(serial)
     await camera.stop_device(serial)
     await devices.retract_ha_discovery(serial, deleted_cfg, deleted_state)
     storage.delete_device(serial)
@@ -716,10 +743,14 @@ async def handle_api_settings_post(request):
     try:
         data = await request.json()
         previous_vp8_transcoding = storage.get_settings().get("camera_vp8_transcoding", False)
+        previous_stream_lifetime = storage.get_settings()["camera_stream_lifetime"]
         result = storage.save_settings(data)
         settings = storage.get_settings()
+        if (settings["camera_stream_lifetime"] != previous_stream_lifetime
+                or settings["camera_vp8_transcoding"] != previous_vp8_transcoding):
+            await camera.refresh_stream_lifetime()
         await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
-        await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"])
+        await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"] or settings.get("feeder_card_display") == "snapshot")
         if settings["camera_vp8_transcoding"] != previous_vp8_transcoding:
             await camera.refresh_live_exposures()
         devices.configure(
@@ -790,11 +821,64 @@ async def handle_api_settings_mqtt_auto_add(request):
 
 
 async def handle_api_capture_start(request):
-    global _capture_state
-    if _capture_state["status"] == "capturing":
+    return _start_capture()
+
+
+async def handle_api_provision_scan(request):
+    global _provision_devices, _provision_scanning
+    if _provision_scanning or (_capture_task and not _capture_task.done()):
+        return web.json_response({"error": "Setup is already running."}, status=409)
+    _provision_scanning = True
+    _provision_devices = {}
+    try:
+        _provision_devices = await provisioning.scan()
+        return web.json_response({"devices": [info for _, info in _provision_devices.values()]})
+    except provisioning.ProvisioningError as error:
+        return web.json_response({"error": str(error)}, status=503)
+    finally:
+        _provision_scanning = False
+
+
+async def handle_api_provision_start(request):
+    if _provision_scanning or (_capture_task and not _capture_task.done()):
+        return web.json_response({"error": "Setup is already running."}, status=409)
+    try:
+        settings = provisioning.validate(await request.json())
+    except (ValueError, TypeError):
+        return web.json_response({"error": "Invalid settings: check the Bluetooth device, SSID, Wi-Fi password, LAN IPv4 address and numeric account identifier."}, status=400)
+    selected = _provision_devices.get(settings["address"])
+    if selected is None:
+        return web.json_response({"error": "Scan and select the device before connecting."}, status=400)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind((settings["broker_ip"], 0))
+    except OSError:
+        return web.json_response({"error": "The MQTT address must belong to this Home Assistant host."}, status=400)
+
+    capture_ready = asyncio.Event()
+    async def connect():
+        def progress(stage, detail):
+            _capture_state.update(stage=stage, detail=detail)
+            if stage == "mqtt_sent":
+                capture_ready.set()
+        try:
+            await provisioning.provision(selected[0], settings, progress)
+        finally:
+            settings.clear()
+
+    return _start_capture(connect, capture_ready=capture_ready)
+
+
+def _start_capture(on_ready=None, capture_ready=None):
+    global _capture_state, _capture_task
+    if _provision_scanning:
+        return web.json_response({"error": "Bluetooth scan is running."}, status=409)
+    if _capture_task and not _capture_task.done():
+        if on_ready is not None:
+            return web.json_response({"error": "Setup is already running."}, status=409)
         return web.json_response({"status": "capturing"})
 
-    _capture_state = {"status": "capturing", "result": {}}
+    _capture_state = {"status": "capturing", "result": {}, "stage": "preparing", "detail": "Preparing MQTT credential capture…"}
 
     async def _run_capture():
         global _capture_state
@@ -802,6 +886,9 @@ async def handle_api_capture_start(request):
         try:
             devices.suppress_alerts(True)
             _LOGGER.info("Stopping Mosquitto for credential capture")
+            # Cancellation can arrive after Supervisor accepted stop but before
+            # its response. Always attempt restoration once stop was requested.
+            mosquitto_was_stopped = True
             stopped = await mosquitto.stop_mosquitto()
             if not stopped:
                 _LOGGER.error("Failed to stop Mosquitto — capture aborted")
@@ -812,10 +899,17 @@ async def handle_api_capture_start(request):
             await asyncio.sleep(3)
 
             known_serials = frozenset(storage.get_devices().keys())
-            creds = await mqtt_broker.capture_credentials(timeout_seconds=60, known_serials=known_serials)
+            creds = await mqtt_broker.capture_credentials(
+                timeout_seconds=120 if on_ready else 60,
+                known_serials=known_serials, on_ready=on_ready,
+                capture_ready=capture_ready,
+                on_binding=lambda: _capture_state.update(
+                    stage="binding", detail="Wi-Fi connected. Waiting for final device binding confirmation…"),
+            )
 
             if creds:
                 _LOGGER.info("Credentials captured for client %s...", creds.get("client_id", "")[:8])
+                devices.expect_binding(creds.get("client_id", ""))
                 # Add device credentials to Mosquitto before restarting so it can authenticate
                 username = creds.get("username", "")
                 password = creds.get("password", "")
@@ -830,28 +924,67 @@ async def handle_api_capture_start(request):
                         )
                 _capture_state = {"status": "captured", "result": creds, "login_saved": login_result in ("added", "exists")}
             else:
-                _capture_state = {"status": "timeout", "result": {}}
+                _capture_state = {"status": "timeout", "result": {}, "detail": "Timed out waiting for the device to complete setup. Check pairing mode and network access, then retry."}
                 _LOGGER.warning("Credential capture timed out — no Petlibro device connected")
+        except provisioning.ProvisioningError as error:
+            _capture_state = {"status": "error", "result": {}, "detail": str(error)}
+        except asyncio.CancelledError:
+            _capture_state = {"status": "error", "result": {}, "detail": "Setup cancelled."}
+            raise
         except Exception:
             _LOGGER.exception("Capture flow error")
-            _capture_state = {"status": "error", "result": {}}
+            _capture_state = {"status": "error", "result": {}, "detail": "Device setup failed unexpectedly. Check the add-on logs for details."}
         finally:
-            if mosquitto_was_stopped:
-                _LOGGER.info("Restarting Mosquitto")
-                await mosquitto.start_mosquitto()
-            devices.suppress_alerts(False)
+            try:
+                if mosquitto_was_stopped:
+                    _LOGGER.info("Restarting Mosquitto")
+                    if not await mosquitto.start_mosquitto():
+                        _capture_state["detail"] = (_capture_state.get("detail", "") + " Mosquitto could not restart. Start it from Home Assistant's add-on page.").strip()
+                        if _capture_state["status"] != "captured":
+                            _capture_state["status"] = "error"
+            except Exception:
+                _capture_state["detail"] = (_capture_state.get("detail", "") + " Mosquitto could not restart. Start it from Home Assistant's add-on page.").strip()
+                if _capture_state["status"] != "captured":
+                    _capture_state["status"] = "error"
+            finally:
+                devices.suppress_alerts(False)
 
-    asyncio.ensure_future(_run_capture())
+    _capture_task = asyncio.create_task(_run_capture())
     return web.json_response({"status": "capturing"})
 
 
 async def handle_api_capture_status(request):
+    if _capture_task and not _capture_task.done():
+        error = (_capture_state.get("detail", "Device setup failed.")
+                 if _capture_state["status"] in ("error", "timeout") else None)
+        return web.json_response({"status": "capturing", "result": {},
+                                  "stage": _capture_state.get("stage"),
+                                  "error": error,
+                                  "detail": (_capture_state.get("detail", "Waiting for credentials…")
+                                             if _capture_state["status"] == "capturing" else "Restoring Mosquitto…")})
     return web.json_response(_capture_state)
 
 
 async def handle_api_capture_reset(request):
     global _capture_state
+    if _capture_task and not _capture_task.done():
+        return web.json_response({"error": "Setup is still finishing. Please wait."}, status=409)
     _capture_state = {"status": "idle", "result": {}}
+    return web.json_response({"status": "ok"})
+
+
+async def handle_api_capture_cancel(request):
+    if _capture_task and not _capture_task.done():
+        # Terminal state is published before restoration starts. Let restoration
+        # finish even when the user closes the dialog during a successful run.
+        if _capture_state["status"] == "capturing" and not _capture_task.cancelling():
+            _capture_task.cancel()
+        try:
+            await asyncio.shield(_capture_task)
+        except asyncio.CancelledError:
+            pass
+        if _capture_state["status"] == "capturing":
+            _capture_state.update(status="error", result={}, detail="Setup cancelled.")
     return web.json_response({"status": "ok"})
 
 
@@ -1154,7 +1287,7 @@ async def on_startup(app):
         _LOGGER.warning("PLAF203 camera support is unavailable until the bridge starts")
     settings = storage.get_settings()
     await camera.set_snapshot_interval(settings["camera_snapshot_interval_secs"])
-    await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"])
+    await camera.set_snapshots_enabled(settings["camera_snapshot_enabled"] or settings.get("feeder_card_display") == "snapshot")
     devices.configure(
         settings["mqtt_host"],
         settings["mqtt_port"],
@@ -1189,7 +1322,9 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
+    await handle_api_capture_cancel(None)
     await camera_talk.stop_all()
+    await recordings.stop_all()
     await camera.stop_bridge()
 
 
@@ -1219,14 +1354,18 @@ async def _restrict_ingress_middleware(request, handler):
 def main():
     app = web.Application(middlewares=[_restrict_ingress_middleware])
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(recordings.on_shutdown)
     app.on_cleanup.append(on_cleanup)
 
     app.router.add_get("/",                              handle_index)
+    app.router.add_get("/camera",                        handle_camera_view)
     app.router.add_get("/icon.png",                      handle_icon)
+    app.router.add_get("/icon-red.png",                  handle_web_icon)
     app.router.add_get("/locales/available",             handle_locales_available)
     app.router.add_get("/locales/{lang}.json",           handle_locale)
     app.router.add_get("/images/{name}",                 handle_device_image)
     app.router.add_get("/audio/{name}",                  handle_audio_serve)
+    app.router.add_get("/audio/feeding/{name}",          handle_audio_serve)
     app.router.add_get(r"/{name:[^/]+\.(js|css)}",       handle_static)
 
     app.router.add_get("/api/devices",                   handle_api_devices_get)
@@ -1235,6 +1374,9 @@ def main():
     app.router.add_get("/api/devices/{serial}/camera/snapshot", handle_api_camera_snapshot)
     app.router.add_get("/api/devices/{serial}/camera/live.mp4", handle_api_camera_live_video)
     app.router.add_get("/api/devices/{serial}/camera/talk", camera_talk.handle_talk)
+    app.router.add_get("/api/devices/{serial}/recordings", recordings.handle_list, allow_head=False)
+    app.router.add_delete(r"/api/devices/{serial}/recordings/{start:\d+}", recordings.handle_delete)
+    app.router.add_get("/api/devices/{serial}/recordings/video.mp4", recordings.handle_video, allow_head=False)
     app.router.add_post("/api/devices/{serial}/camera/webrtc", handle_api_camera_webrtc)
     app.router.add_delete("/api/devices/{serial}/camera/webrtc/{session_id}", handle_api_camera_webrtc_close)
     app.router.add_post("/api/devices/{serial}/camera/exposure", handle_api_camera_live_exposure)
@@ -1280,6 +1422,9 @@ def main():
     app.router.add_post("/api/capture/start",            handle_api_capture_start)
     app.router.add_get("/api/capture/status",            handle_api_capture_status)
     app.router.add_post("/api/capture/reset",            handle_api_capture_reset)
+    app.router.add_post("/api/capture/cancel",           handle_api_capture_cancel)
+    app.router.add_post("/api/provision/scan",           handle_api_provision_scan)
+    app.router.add_post("/api/provision/start",          handle_api_provision_start)
 
     app.router.add_get("/api/about",                     handle_api_about)
     app.router.add_get("/api/ha-areas",                  handle_api_ha_areas)

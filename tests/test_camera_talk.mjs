@@ -38,6 +38,7 @@ function harness(getUserMedia, options = {}) {
     document: { getElementById: id => elements[id], querySelector: () => video },
     BASE: '/prefix', AudioWorkletNode: Node, WebSocket: Socket, URL,
     _currentDevice: options.device || { serial: 'serial', cameraSwitch: true },
+    _settings: {},
     api: async (_method, _url, data) => { powerCommands.push(data.cameraSwitch); await options.power?.(data.cameraSwitch); },
     _patchDevice() {},
     setTimeout: () => 1, clearTimeout() {}

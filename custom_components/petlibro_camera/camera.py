@@ -98,7 +98,14 @@ class PetlibroLiveCamera(Camera):
         return DeviceInfo(**info)
 
     async def stream_source(self) -> str:
-        return self._source
+        # HA's stream pipeline uses H.264/AAC; browser WebRTC can use the
+        # shared stream's VP8/Opus tracks without changing HA's selection.
+        return f"{self._source}?video=h264&audio=aac"
+
+    @property
+    def use_stream_for_stills(self) -> bool:
+        """Let HA render previews from the relay without an active live viewer."""
+        return True
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         return None

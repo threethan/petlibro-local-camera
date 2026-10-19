@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-function render(device, category = "sensors") {
+function render(device, category = "sensors", settings = {}) {
   const scope = vm.createContext({
     t: key => key,
     escHtml: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'),
@@ -12,6 +12,7 @@ function render(device, category = "sensors") {
     window: { addEventListener() {} },
     device,
     category,
+    _settings: settings,
   });
   vm.runInContext(readFileSync(new URL('../addon/app/modal-device.js', import.meta.url), 'utf8'), scope);
   return vm.runInContext('buildCameraSettingsTab(device, category)', scope);
@@ -63,6 +64,21 @@ test('Home Assistant camera options use checkboxes', () => {
   assert.match(html, /<input type="checkbox" id="camera-power-with-live-view"/);
   assert.match(html, /<input type="checkbox" id="camera-ha-expose"[^>]*checked/);
   assert.ok(!html.includes('role="switch"'));
+});
+
+test('always-on cameras hide the power override but allow Home Assistant exposure changes', () => {
+  const html = render({camera_power_with_live_view: true, live_camera_exposed: true}, 'sensors',
+    {camera_stream_lifetime: 'home_assistant'});
+  assert.ok(!html.includes('camera-power-with-live-view'));
+  assert.match(html, /<input type="checkbox" id="camera-ha-expose"[^>]*checked/);
+  assert.ok(!/<input[^>]*id="camera-ha-expose"[^>]*disabled/.test(html));
+  assert.ok(!html.includes('settings.camera_power_with_live_view'));
+  assert.ok(html.includes('Live Camera in Home Assistant'));
+  assert.ok(!html.includes('keeps the camera on after live view closes'));
+  assert.ok(!html.includes('Kept available in the background'));
+  assert.ok(html.includes('data-camera-setting="resolution"'));
+  const hidden = render({live_camera_exposed: false}, 'sensors', {camera_stream_lifetime: 'home_assistant'});
+  assert.ok(!/<input[^>]*id="camera-ha-expose"[^>]*checked/.test(hidden));
 });
 
 test('indicator light settings display scheduled hours from UTC reports', () => {

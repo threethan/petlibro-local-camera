@@ -1,4 +1,4 @@
-"""Exercise the FFmpeg RTSP callback forwarding with real TCP sockets."""
+"""Exercise the Home Assistant RTSP relay with real TCP sockets."""
 
 import asyncio
 import importlib.util
@@ -39,17 +39,17 @@ class RtspLoopbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
         self.target = patch.multiple(
-            camera, _HA_RTSP_HOST="127.0.0.1",
-            _HA_RTSP_PORT=self.upstream.sockets[0].getsockname()[1],
+            camera, _INTERNAL_RTSP_HOST="127.0.0.1",
+            _INTERNAL_RTSP_PORT=self.upstream.sockets[0].getsockname()[1],
         )
         self.target.start()
-        camera._rtsp_loopback_server = await asyncio.start_server(
-            camera._forward_rtsp_loopback, "127.0.0.1", 0,
+        camera._ha_rtsp_server = await asyncio.start_server(
+            camera._forward_ha_rtsp, "127.0.0.1", 0,
         )
-        self.port = camera._rtsp_loopback_server.sockets[0].getsockname()[1]
+        self.port = camera._ha_rtsp_server.sockets[0].getsockname()[1]
 
     async def asyncTearDown(self):
-        await asyncio.wait_for(camera._stop_rtsp_loopback(), 3)
+        await asyncio.wait_for(camera._stop_ha_rtsp(), 3)
         for writer in self.clients + self.upstreams:
             writer.close()
             await writer.wait_closed()
@@ -81,10 +81,10 @@ class RtspLoopbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shutdown_closes_active_connections(self):
         reader, _ = await self.connect()
-        await asyncio.wait_for(camera._stop_rtsp_loopback(), 3)
+        await asyncio.wait_for(camera._stop_ha_rtsp(), 3)
         self.assertEqual(await asyncio.wait_for(reader.read(), 3), b"")
-        self.assertFalse(camera._rtsp_loopback_tasks)
-        self.assertIsNone(camera._rtsp_loopback_server)
+        self.assertFalse(camera._ha_rtsp_tasks)
+        self.assertIsNone(camera._ha_rtsp_server)
 
 
 if __name__ == "__main__":

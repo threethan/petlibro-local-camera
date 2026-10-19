@@ -19,7 +19,7 @@ function renderDevices() {
     plans: (d.feeding_plans||[]).map(p=>p.executionTime+"_"+(p._enabled!==false?1:0)).join(),
     dt: d.display_text, din: d.display_icon_name, di: d.display_icon,
     pets: (d.pets || []).map(p => `${p.id}:${p.image_url}:${p.name}`).join(),
-    units: _settings.units,
+    units: _settings.units, cardDisplay: _settings.feeder_card_display, camera: d.cameraSwitch,
   })));
   if (key === _lastDeviceRenderKey) return;
   _lastDeviceRenderKey = key;
@@ -44,6 +44,7 @@ function renderDevices() {
     const imageUrl = d.image_url || (d.device_type === "camera_feeder"
       ? deviceImageUrl(d.device_type, d.variant || "b")
       : "");
+    const cameraDisplay = d.device_type === "camera_feeder" && ["live", "snapshot"].includes(_settings.feeder_card_display);
     const imgHtml = imageUrl
       ? `<img src="${escHtml(imageUrl)}" alt="">`
       : `<div class="card-img-placeholder"><span class="material-icons">${icon}</span></div>`;
@@ -74,6 +75,7 @@ function renderDevices() {
     return `<div class="ha-card device-card" data-serial="${escHtml(d.serial)}">
       <div class="card-img-wrap">
         ${imgHtml}
+        ${cameraDisplay ? `<div class="card-camera" data-camera-serial="${escHtml(d.serial)}"></div>` : ""}
         <div class="card-status ${statusClass}"><svg viewBox="0 0 24 18" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M12 14a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm-4.24-2.83a6 6 0 0 1 8.48 0l-1.42 1.42a4 4 0 0 0-5.65 0L7.76 11.17zm-2.83-2.83a10 10 0 0 1 14.14 0l-1.42 1.42a8 8 0 0 0-11.31 0L4.93 8.34zM1.1 5.51a15 15 0 0 1 21.21 0l-1.42 1.42a13 13 0 0 0-18.38 0L1.1 5.51z"/></svg></div>
         ${alertDot}
         ${petsHtml ? `<div class="card-pets">${petsHtml}</div>` : ""}
@@ -121,6 +123,8 @@ function renderDevices() {
       </div>
     </div>`;
   }).join("");
+
+  syncFeederCardCameras();
 
   grid.querySelectorAll(".device-card").forEach(card => {
     card.addEventListener("click", () => {

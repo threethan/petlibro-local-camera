@@ -96,18 +96,42 @@
     return "";
   };
 
+  // The red artwork uses #ed1f24. Rotate its hue to the resolved UI accent;
+  // gray and white details in the image remain unchanged by hue-rotate().
+  const iconRedHue = 358.54;
+  const updateIconHue = () => {
+    const color = getComputedStyle(document.documentElement).getPropertyValue("--pl-accent").trim();
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 1;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.fillStyle = color;
+    context.fillRect(0, 0, 1, 1);
+    const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const range = max - min;
+    if (!range) return;
+    let hue = max === r ? (g - b) / range : max === g ? (b - r) / range + 2 : (r - g) / range + 4;
+    hue = (hue * 60 + 360) % 360;
+    const rotation = ((hue - iconRedHue + 540) % 360) - 180;
+    document.documentElement.style.setProperty("--pl-icon-hue-rotate", `${rotation.toFixed(2)}deg`);
+  };
+
   const applyTheme = () => {
     scheduled = false;
     const doc = getHostDocument();
-    if (!doc) return;
-    const elements = themedElements(doc);
     const rootStyle = document.documentElement.style;
-    for (const [localName, hostNames] of Object.entries(tokenMap)) {
-      const value = readThemeValue(elements, hostNames);
-      if (value) rootStyle.setProperty(localName, value);
+    if (doc) {
+      const elements = themedElements(doc);
+      for (const [localName, hostNames] of Object.entries(tokenMap)) {
+        const value = readThemeValue(elements, hostNames);
+        if (value) rootStyle.setProperty(localName, value);
+      }
+      const font = readThemeValue(elements, ["--primary-font-family"]);
+      if (font) rootStyle.setProperty("--primary-font-family", font);
     }
-    const font = readThemeValue(elements, ["--primary-font-family"]);
-    if (font) rootStyle.setProperty("--primary-font-family", font);
+    updateIconHue();
   };
 
   const scheduleApply = () => {

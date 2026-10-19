@@ -20,7 +20,8 @@ function detachBackgroundCamera(serial) {
   const session = getBackgroundCamera(serial);
   if (!session?.video) return;
   session.video.muted = true;
-  backgroundCameraHost().append(session.video);
+  const card = feederCameraCard(serial);
+  (card || backgroundCameraHost()).append(session.video);
   session.video.play().catch(() => {});
 }
 
@@ -55,7 +56,7 @@ async function connectBackgroundCamera(device) {
       video.autoplay = true;
       video.playsInline = true;
       video.muted = true;
-      video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain";
+      video.className = "camera-video";
       session.video = video;
       backgroundCameraHost().append(video);
       try {
@@ -133,7 +134,7 @@ async function connectBackgroundCamera(device) {
 }
 
 function syncBackgroundCameras() {
-  const enabled = _settings.camera_preload_live_feeds === true;
+  const enabled = (_settings.camera_stream_lifetime || (_settings.camera_preload_live_feeds === true ? "web_interface" : "viewing")) !== "viewing" || _settings.feeder_card_display === "live";
   const wanted = new Map(enabled ? _devices.filter(device =>
     device.device_type === "camera_feeder" && device.online &&
     (device.cameraSwitch !== false || device.camera_power_with_live_view === true)
@@ -142,7 +143,9 @@ function syncBackgroundCameras() {
     if (!wanted.has(serial)) closeBackgroundCamera(serial);
   }
   for (const [serial, device] of wanted) {
-    if (!_backgroundCameras.has(serial)) connectBackgroundCamera(device);
+    if (!_backgroundCameras.has(serial)) connectBackgroundCamera(device).then(session => session.ready.then(() => {
+      if (_settings.feeder_card_display === "live") syncFeederCardCameras();
+    }));
   }
 }
 
@@ -150,3 +153,36 @@ window.addEventListener("pagehide", () => {
   for (const serial of _backgroundCameras.keys()) closeBackgroundCamera(serial);
 });
 window.addEventListener("pageshow", syncBackgroundCameras);
+
+// Cards and the status view share the same muted camera connection.
+function feederCameraCard(serial) {
+  if (_settings.feeder_card_display !== "live") return null;
+  return [...document.querySelectorAll(".card-camera")].find(card => card.dataset.cameraSerial === serial) || null;
+}
+let _feederSnapshotTimer = null;
+let _feederSnapshotGeneration = 0;
+function syncFeederCardCameras() {
+  clearTimeout(_feederSnapshotTimer);
+  const generation = ++_feederSnapshotGeneration;
+  document.querySelectorAll(".card-camera").forEach(card => {
+    const serial = card.dataset.cameraSerial;
+    if (_settings.feeder_card_display === "live") {
+      const session = getBackgroundCamera(serial);
+      if (session?.video && !session.closed && _liveCameraBackgroundSerial !== serial) {
+        card.replaceChildren(session.video);
+        session.video.muted = true;
+        session.video.play().catch(() => {});
+      }
+    } else if (_settings.feeder_card_display === "snapshot") {
+      const image = new Image();
+      image.alt = "Latest camera snapshot";
+      image.onload = () => {
+        if (generation === _feederSnapshotGeneration && card.isConnected) card.replaceChildren(image);
+      };
+      image.src = `${BASE}/api/devices/${encodeURIComponent(serial)}/camera/snapshot?t=${Date.now()}`;
+    }
+  });
+  if (_settings.feeder_card_display === "snapshot") {
+    _feederSnapshotTimer = setTimeout(syncFeederCardCameras, Math.max(1, _settings.camera_snapshot_interval_secs || 15) * 1000);
+  }
+}

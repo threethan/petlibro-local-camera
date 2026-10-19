@@ -39,7 +39,7 @@ test('copies Home Assistant theme variables into the ingress UI tokens', () => {
     ['--ha-color-on-primary-loud', '#fefefe'],
   ]);
   const scope = vm.createContext({
-    document: { documentElement: root },
+    document: { documentElement: root, createElement: () => ({ getContext: () => null }) },
     window: { parent: { document: hostDocument }, MutationObserver: null },
     getComputedStyle: element => ({ getPropertyValue: name => element === haRoot ? (theme.get(name) || '') : '' }),
     setTimeout: () => 0,

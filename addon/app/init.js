@@ -6,6 +6,9 @@ function switchSettingsTab(name) {
 }
 
 function switchTab(name) {
+  if ((name === "videos" && _settings.show_videos_tab === false)
+      || (name === "pets" && _settings.show_pets_tab === false)) name = "devices";
+  if (typeof setRecordingsTabActive === "function") setRecordingsTabActive(name === "videos");
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === `panel-${name}`));
   const sw = document.getElementById("header-sort-wrap");
@@ -17,6 +20,7 @@ function renderDeviceUpdates() {
   syncBackgroundCameras();
   renderDevices();
   checkAlerts();
+  if (typeof syncRecordingsDevices === "function") syncRecordingsDevices();
   if (_currentDevice) {
     const device = _devices.find(d => d.serial === _currentDevice.serial);
     if (device) updateDeviceModalStatus(device);
@@ -72,6 +76,14 @@ async function detectLanguage(availableLangs) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────
+function openRequestedDevice() {
+  const serial = new URLSearchParams(location.search).get("device");
+  const device = _devices.find(device => device.serial === serial);
+  if (!device) return;
+  switchTab("devices");
+  openDeviceModal(device);
+}
+
 (async () => {
   // Load settings first (needed for language + units)
   try {
@@ -159,9 +171,28 @@ async function detectLanguage(availableLangs) {
   // Wire add device
   document.getElementById("btn-close-add").addEventListener("click", () => {
     document.getElementById("modal-add-device").classList.remove("open");
-    stopCapturePolling();
+    cancelDeviceSetup();
   });
   document.getElementById("btn-add-device").addEventListener("click", openAddDevice);
+  document.getElementById("btn-method-new").addEventListener("click", () => {
+    showNewDeviceStep(0);
+    showAddView("new");
+  });
+  document.getElementById("btn-new-scan").addEventListener("click", scanNewDevices);
+  document.getElementById("btn-new-start").addEventListener("click", startNewDevice);
+  document.getElementById("btn-new-back").addEventListener("click", () => showAddView("method"));
+  document.getElementById("btn-new-next").addEventListener("click", nextNewDeviceStep);
+  document.getElementById("n-device").addEventListener("change", updateNewDeviceNext);
+  document.getElementById("btn-new-wifi-back").addEventListener("click", () => showNewDeviceStep(0));
+  document.getElementById("btn-setup-cancel").addEventListener("click", async () => {
+    await cancelDeviceSetup();
+    showAddView("method");
+  });
+  document.getElementById("btn-new-setup-cancel").addEventListener("click", async () => {
+    await cancelDeviceSetup();
+    showNewDeviceStep(1);
+    showAddView("new");
+  });
   document.getElementById("btn-method-auto").addEventListener("click", () => {
     showAddView("auto"); showAutoStep(0);
   });
@@ -253,6 +284,8 @@ async function detectLanguage(availableLangs) {
   document.querySelectorAll(".modal-backdrop").forEach(bd => {
     bd.addEventListener("click", e => {
       if (e.target !== bd) return;
+      // Keep every add-device step open until explicitly closed or completed.
+      if (bd.id === "modal-add-device") return;
       // Recording modal needs its own close path so a click-outside while
       // actively recording actually stops the mic stream, not just hides it.
       if (bd.id === "modal-record-audio") { closeRecordAudioModal(); return; }
@@ -271,6 +304,8 @@ async function detectLanguage(availableLangs) {
   checkAlerts();
   checkMqttSetup();
   checkPetSetup();
+
+  openRequestedDevice();
 
   setInterval(pollRefresh, 8000);
   document.addEventListener("visibilitychange", pingVisibleDevices);

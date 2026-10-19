@@ -98,7 +98,7 @@ async function renderAudioLibrary() {
         <div style="display:flex;align-items:center;justify-content:space-between;background:var(--pl-surface2);border:1px solid var(--pl-border);border-radius:8px;padding:8px 12px;gap:8px">
           <span style="flex:1">${escHtml(n)}</span>
           <button class="btn-audio-play" data-name="${escHtml(n)}" title="${t("settings.audio_play")}" style="background:none;border:none;cursor:pointer;padding:4px;color:var(--pl-accent);font-size:16px;line-height:1;flex-shrink:0">▶</button>
-          <button class="btn-audio-delete" data-name="${escHtml(n)}" title="${t("settings.audio_delete")}" style="background:none;border:none;cursor:pointer;padding:4px;color:var(--pl-danger,#e05252);font-size:16px;line-height:1;opacity:0.8">&#x2715;</button>
+          <button class="btn-audio-delete" data-name="${escHtml(n)}" title="${t("settings.audio_delete")}" aria-label="${t("settings.audio_delete")}"><span class="material-icons" aria-hidden="true">close</span></button>
         </div>`).join("")
       : `<p class="form-hint">${t("settings.audio_library_empty")}</p>`;
     list.querySelectorAll(".btn-audio-play").forEach(btn => {
@@ -288,7 +288,19 @@ function closeRecordAudioModal() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────
+function applyTabVisibility() {
+  let activeTabHidden = false;
+  document.querySelectorAll(".tab-btn").forEach(button => {
+    button.hidden = (button.dataset.tab === "videos" && _settings.show_videos_tab === false)
+      || (button.dataset.tab === "pets" && _settings.show_pets_tab === false);
+    if (button.hidden && button.classList.contains("active")) activeTabHidden = true;
+  });
+  if (activeTabHidden) switchTab("devices");
+  checkPetSetup();
+}
+
 function renderSettings() {
+  applyTabVisibility();
   document.getElementById("s-mqtt-host").value = _settings.mqtt_host || "";
   document.getElementById("s-mqtt-port").value = _settings.mqtt_port || 1883;
   document.getElementById("s-mqtt-user").value = _settings.mqtt_user || "";
@@ -301,14 +313,22 @@ function renderSettings() {
   }
   const bellCb = document.getElementById("s-notify-bell");
   if (bellCb) bellCb.checked = _settings.notify_bell_enabled !== false;
+  const manualFeedLimitCb = document.getElementById("s-manual-feed-half-cup-limit");
+  if (manualFeedLimitCb) manualFeedLimitCb.checked = _settings.manual_feed_half_cup_limit !== false;
   const devicePingCb = document.getElementById("s-device-ping-enabled");
   if (devicePingCb) devicePingCb.checked = _settings.device_ping_enabled !== false;
+  const videosTabCb = document.getElementById("s-show-videos-tab");
+  if (videosTabCb) videosTabCb.checked = _settings.show_videos_tab !== false;
+  const petsTabCb = document.getElementById("s-show-pets-tab");
+  if (petsTabCb) petsTabCb.checked = _settings.show_pets_tab !== false;
+  const cardDisplayEl = document.getElementById("s-feeder-card-display");
+  if (cardDisplayEl) cardDisplayEl.value = _settings.feeder_card_display || "product";
   const cameraAutoStartEl = document.getElementById("s-camera-auto-start");
   if (cameraAutoStartEl) cameraAutoStartEl.checked = _settings.camera_auto_start_live_view === true;
-  const cameraPreloadEl = document.getElementById("s-camera-preload-live-feeds");
-  if (cameraPreloadEl) cameraPreloadEl.checked = _settings.camera_preload_live_feeds === true;
-  const forceLandscapeMobileEl = document.getElementById("s-camera-force-landscape-mobile");
-  if (forceLandscapeMobileEl) forceLandscapeMobileEl.checked = _settings.camera_force_landscape_mobile === true;
+  const cameraLifetimeEl = document.getElementById("s-camera-stream-lifetime");
+  if (cameraLifetimeEl) cameraLifetimeEl.value = _settings.camera_stream_lifetime || (_settings.camera_preload_live_feeds === true ? "web_interface" : "viewing");
+  const rotationEl = document.getElementById("s-camera-fullscreen-rotation");
+  if (rotationEl) rotationEl.value = cameraFullscreenRotation();
   const emailTo = document.getElementById("s-notify-email-to");
   if (emailTo) emailTo.value = _settings.notify_email_to || "";
 
@@ -334,6 +354,8 @@ function renderSettings() {
     cameraIntervalEl.value = _settings.camera_snapshot_interval_secs ?? 15;
   }
   const vp8TranscodingEl = document.getElementById("s-camera-vp8-transcoding");
+  const h264StartupFixEl = document.getElementById("s-camera-h264-startup-fix");
+  if (h264StartupFixEl) h264StartupFixEl.checked = _settings.camera_h264_startup_fix !== false;
   if (vp8TranscodingEl) vp8TranscodingEl.checked = _settings.camera_vp8_transcoding === true;
   const audioUrlEl = document.getElementById("s-local-audio-base-url");
   if (audioUrlEl) audioUrlEl.value = _settings.local_audio_base_url || "";
@@ -353,10 +375,14 @@ async function saveSettings(fromTab) {
     mqtt_user: document.getElementById("s-mqtt-user").value.trim(),
     mqtt_pass: document.getElementById("s-mqtt-pass").value,
     language: document.getElementById("s-language").value,
+    manual_feed_half_cup_limit: document.getElementById("s-manual-feed-half-cup-limit")?.checked !== false,
     device_ping_enabled: document.getElementById("s-device-ping-enabled")?.checked !== false,
+    show_videos_tab: document.getElementById("s-show-videos-tab")?.checked !== false,
+    show_pets_tab: document.getElementById("s-show-pets-tab")?.checked !== false,
+    feeder_card_display: document.getElementById("s-feeder-card-display")?.value || "product",
     camera_auto_start_live_view: document.getElementById("s-camera-auto-start")?.checked === true,
-    camera_preload_live_feeds: document.getElementById("s-camera-preload-live-feeds")?.checked === true,
-    camera_force_landscape_mobile: document.getElementById("s-camera-force-landscape-mobile")?.checked === true,
+    camera_stream_lifetime: document.getElementById("s-camera-stream-lifetime")?.value || "viewing",
+    camera_fullscreen_rotation: document.getElementById("s-camera-fullscreen-rotation")?.value || "off",
     units: document.getElementById("s-units").value,
     feeder_timezone: document.getElementById("s-feeder-tz")?.value || "America/Denver",
     notify_bell_enabled: document.getElementById("s-notify-bell")?.checked !== false,
@@ -367,13 +393,16 @@ async function saveSettings(fromTab) {
     camera_snapshot_interval_secs: Number(cameraIntervalEl?.value || 15),
     camera_snapshot_enabled: document.getElementById("s-camera-snapshot-enabled")?.checked === true,
     camera_vp8_transcoding: document.getElementById("s-camera-vp8-transcoding")?.checked === true,
+    camera_h264_startup_fix: document.getElementById("s-camera-h264-startup-fix")?.checked === true,
   };
   const statusEl = document.getElementById("mqtt-status");
   statusEl.className = "mqtt-status";
   try {
     const result = await api("POST", "/api/settings", body);
     _settings = result;
+    applyTabVisibility();
     syncLiveCameraFullscreen();
+    syncRecordingFullscreen();
     syncBackgroundCameras();
     const saveButtonId = fromTab === "audio" ? "btn-save-audio-settings" : `btn-save-${fromTab}`;
     const saveButton = document.getElementById(saveButtonId);
@@ -461,7 +490,7 @@ function checkMqttSetup() {
 function checkPetSetup() {
   const banner = document.getElementById("pet-setup-banner");
   if (!banner) return;
-  if (!isMqttConfigured() || !_devices.length || _pets.length > 0) {
+  if (_settings.show_pets_tab === false || !isMqttConfigured() || !_devices.length || _pets.length > 0) {
     banner.style.display = "none";
     return;
   }

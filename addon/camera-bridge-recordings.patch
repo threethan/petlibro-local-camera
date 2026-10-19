@@ -1,0 +1,347 @@
+--- a/camera-bridge/internal/plaf203/login.go
++++ b/camera-bridge/internal/plaf203/login.go
+@@ -19,7 +19,8 @@
+ 	loginFieldLength    = 257
+ 
+ 	sessionFlags                     = 0x0A
+-	clientSessionMagicVersion        = 0x1C
++	clientSessionFlags               = 0x0B
++	clientSessionMagicVersion        = 0x1D
+ 	deviceSessionMagicVersion        = 0x1B
+ 	clientSessionOpcode       uint16 = 0x0407
+ 	deviceSessionOpcode       uint16 = 0x0408
+@@ -101,6 +102,7 @@
+ 	talkMu                sync.Mutex
+ 	talk                  *talkbackState
+ 	talkClosed            bool
++	recordings            recordingState
+ }
+ 
+ // FrameCallback receives one complete H.264 access unit. Implementations must
+@@ -117,6 +119,7 @@
+ 		return nil
+ 	}
+ 	session.closeOnce.Do(func() {
++		session.closeRecordings()
+ 		session.closeTalkback()
+ 		_ = session.StopAudio()
+ 		if session.cancelReceive != nil {
+@@ -287,7 +290,7 @@
+ 	packet[0] = 0x04
+ 	packet[1] = 0x02
+ 	packet[2] = clientSessionMagicVersion
+-	packet[3] = sessionFlags
++	packet[3] = clientSessionFlags
+ 	binary.LittleEndian.PutUint16(packet[4:], loginRequestLength-16)
+ 	binary.LittleEndian.PutUint16(packet[6:], request.Sequence)
+ 	binary.LittleEndian.PutUint16(packet[8:], clientSessionOpcode)
+@@ -322,7 +325,7 @@
+ 	if len(packet) != loginResponseLength {
+ 		return LoginResponse{}, fmt.Errorf("%w: login response got=%d want=%d", ErrPacketTooShort, len(packet), loginResponseLength)
+ 	}
+-	if packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3] != sessionFlags ||
++	if packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3]&^byte(1) != sessionFlags ||
+ 		binary.LittleEndian.Uint16(packet[4:]) != loginResponseLength-16 ||
+ 		binary.LittleEndian.Uint16(packet[8:]) != deviceSessionOpcode ||
+ 		binary.LittleEndian.Uint16(packet[10:]) != deviceLoginSubtype {
+--- a/camera-bridge/internal/plaf203/session.go
++++ b/camera-bridge/internal/plaf203/session.go
+@@ -178,7 +178,7 @@
+ 			step = "client_start_secondary"
+ 		}
+ 		emit(observe, Event{State: StateLoggingIn, Address: address, Step: step})
+-		if sendErr := transport.SendTo(tutk.TransCodePartial(nil, encoded), address); sendErr != nil {
++		if sendErr := transport.SendTo(tutk.TransCodeBlob(encoded), address); sendErr != nil {
+ 			return nil, fmt.Errorf("send PLAF203 login: %w", sendErr)
+ 		}
+ 	}
+@@ -193,15 +193,15 @@
+ 		if receiveErr != nil {
+ 			return nil, fmt.Errorf("receive PLAF203 login response: %w", receiveErr)
+ 		}
+-		decoded := tutk.ReverseTransCodePartial(nil, response)
++		decoded := tutk.ReverseTransCodeBlob(response)
+ 		if _, decodeErr := DecodeLoginResponse(decoded, nonce); decodeErr != nil {
+ 			continue
+ 		}
+ 		session := &Session{
+-			ID:        nonce,
+-			Address:   cloneUDPAddress(address),
+-			transport: transport,
+-			clock:     clock,
++			ID:           nonce,
++			Address:      cloneUDPAddress(address),
++			transport:    transport,
++			clock:        clock,
+ 			sequence:     2,
+ 			controlIndex: 3,
+ 			session25:    newSession25State(),
+@@ -276,6 +276,7 @@
+ 	session.cancelReceive = cancel
+ 	diagnostics := newBootstrapDiagnostics(session.ID, session.observer)
+ 	go func() {
++		defer session.closeRecordings()
+ 		for {
+ 			packet, peer, err := session.transport.Receive(receiveContext)
+ 			if err != nil {
+@@ -289,7 +290,10 @@
+ 				}
+ 				return
+ 			}
+-			decoded := tutk.ReverseTransCodePartial(nil, packet)
++			decoded := tutk.ReverseTransCodeBlob(packet)
++			if session.handleRecordingPacket(decoded, peer) {
++				continue
++			}
+ 			if handled, keepaliveErr := session.replyKeepalive(decoded, peer); keepaliveErr != nil {
+ 				return
+ 			} else if handled {
+@@ -301,6 +305,10 @@
+ 				continue
+ 			}
+ 			if inner, decodeErr := decodeDeviceSession(decoded, session.ID); decodeErr == nil {
++				if session.handleRecordingControl(inner) {
++					_ = session.sendSession25Counters(diagnostics)
++					continue
++				}
+ 				if handled, countersErr := session.replySession25Counters(inner, peer, diagnostics); countersErr != nil {
+ 					return
+ 				} else if handled {
+--- a/camera-bridge/internal/plaf203/bootstrap.go
++++ b/camera-bridge/internal/plaf203/bootstrap.go
+@@ -13,20 +13,20 @@
+ )
+ 
+ const (
+-	defaultBootstrapTimeout   = 5 * time.Second
+-	bootstrapReplyTimeout     = 750 * time.Millisecond
+-	controlInnerLength        = 36
+-	controlChannelStream      = 0x1000
+-	controlChannelSystem      = 0x7000
+-	controlSetStream          = 0x0024
+-	controlSetStreamReply     = controlSetStream + 1
+-	controlGetFormat          = 0x032A
+-	controlGetFormatReply     = controlGetFormat + 1
+-	controlStartVideo         = 0x01FF
+-	controlStartVideoReply    = controlStartVideo + 1
+-	controlStartAudio         = 0x0300
+-	controlStopAudio          = 0x0301
+-	streamStartArgumentSize   = 8
++	defaultBootstrapTimeout = 5 * time.Second
++	bootstrapReplyTimeout   = 750 * time.Millisecond
++	controlInnerLength      = 36
++	controlChannelStream    = 0x1000
++	controlChannelSystem    = 0x7000
++	controlSetStream        = 0x0024
++	controlSetStreamReply   = controlSetStream + 1
++	controlGetFormat        = 0x032A
++	controlGetFormatReply   = controlGetFormat + 1
++	controlStartVideo       = 0x01FF
++	controlStartVideoReply  = controlStartVideo + 1
++	controlStartAudio       = 0x0300
++	controlStopAudio        = 0x0301
++	streamStartArgumentSize = 8
+ 	// Official PLAF203 captures show eight zero-valued ctrl_data bytes for
+ 	// both AUDIOSTART (0x0300) and AUDIOSTOP (0x0301).
+ 	audioControlArgumentSize  = 8
+@@ -95,7 +95,7 @@
+ 	binary.LittleEndian.PutUint32(payload, controlStartVideo)
+ 	body := encodeControlData(session.nextSession25ControlCounter(), controlChannelSystem, 2, payload)
+ 	packet := encodeClientSessionPacket(session.ID, session.nextSequence(), body)
+-	wire := tutk.TransCodePartial(nil, packet)
++	wire := tutk.TransCodeBlob(packet)
+ 	emit(session.observer, Event{
+ 		State:          StateBootstrapping,
+ 		Address:        cloneUDPAddress(session.Address),
+@@ -241,6 +241,10 @@
+ 			continue
+ 		}
+ 		if inner, decodeErr := decodeDeviceSession(decoded, session.ID); decodeErr == nil {
++			if session.handleRecordingControl(inner) {
++				_ = session.sendSession25Counters(diagnostics)
++				continue
++			}
+ 			if handled, countersErr := session.replySession25Counters(inner, peer, diagnostics); countersErr != nil {
+ 				return nil, countersErr
+ 			} else if handled {
+@@ -388,7 +392,7 @@
+ }
+ 
+ func encodeKeepaliveReply(packet []byte) ([]byte, bool) {
+-	if len(packet) != keepalivePacketLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3] != sessionFlags || binary.LittleEndian.Uint16(packet[4:6]) != 8 || binary.LittleEndian.Uint16(packet[8:10]) != keepaliveResponseOpcode || binary.LittleEndian.Uint16(packet[10:12]) != keepaliveResponseSubtype {
++	if len(packet) != keepalivePacketLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3]&^byte(1) != sessionFlags || binary.LittleEndian.Uint16(packet[4:6]) != 8 || binary.LittleEndian.Uint16(packet[8:10]) != keepaliveResponseOpcode || binary.LittleEndian.Uint16(packet[10:12]) != keepaliveResponseSubtype {
+ 		return nil, false
+ 	}
+ 	reply := append([]byte(nil), packet...)
+@@ -424,7 +428,7 @@
+ }
+ 
+ func (session *Session) sendPacket(packet []byte) error {
+-	return session.transport.SendTo(tutk.TransCodePartial(nil, packet), session.Address)
++	return session.transport.SendTo(tutk.TransCodeBlob(packet), session.Address)
+ }
+ 
+ func (session *Session) nextSequence() uint16 {
+@@ -446,7 +450,7 @@
+ 	packet[0] = 0x04
+ 	packet[1] = 0x02
+ 	packet[2] = clientSessionMagicVersion
+-	packet[3] = sessionFlags
++	packet[3] = clientSessionFlags
+ 	binary.LittleEndian.PutUint16(packet[4:], uint16(len(packet)-16))
+ 	binary.LittleEndian.PutUint16(packet[6:], sequence)
+ 	binary.LittleEndian.PutUint16(packet[8:], clientSessionOpcode)
+@@ -457,7 +461,7 @@
+ }
+ 
+ func decodeDeviceSession(packet []byte, expectedSessionID [8]byte) ([]byte, error) {
+-	if len(packet) < sessionHeaderLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3] != sessionFlags || binary.LittleEndian.Uint16(packet[4:6]) != uint16(len(packet)-16) || binary.LittleEndian.Uint16(packet[8:10]) != deviceSessionOpcode || binary.LittleEndian.Uint16(packet[10:12]) != deviceLoginSubtype || string(packet[12:28]) != string(sessionID16(expectedSessionID)) {
++	if len(packet) < sessionHeaderLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != deviceSessionMagicVersion || packet[3]&^byte(1) != sessionFlags || binary.LittleEndian.Uint16(packet[4:6]) != uint16(len(packet)-16) || binary.LittleEndian.Uint16(packet[8:10]) != deviceSessionOpcode || binary.LittleEndian.Uint16(packet[10:12]) != deviceLoginSubtype || string(packet[12:28]) != string(sessionID16(expectedSessionID)) {
+ 		return nil, ErrUnexpectedPacket
+ 	}
+ 	return packet[sessionHeaderLength:], nil
+--- a/camera-bridge/internal/plaf203/bootstrap_diagnostics.go
++++ b/camera-bridge/internal/plaf203/bootstrap_diagnostics.go
+@@ -77,7 +77,7 @@
+ // observe applies the required reversible wire transform, records an inbound
+ // datagram before Session16 filtering, and returns the decoded bytes.
+ func (diagnostics *bootstrapDiagnostics) observe(packet []byte, peer *net.UDPAddr) ([]byte, bootstrapPacketDetails) {
+-	decoded := tutk.ReverseTransCodePartial(nil, packet)
++	decoded := tutk.ReverseTransCodeBlob(packet)
+ 	details := inspectBootstrapPacket(decoded, peer, diagnostics.sessionID)
+ 	diagnostics.packetCount++
+ 	diagnostics.byteCount += uint64(len(packet))
+--- a/camera-bridge/internal/bridge/http.go
++++ b/camera-bridge/internal/bridge/http.go
+@@ -11,6 +11,9 @@
+ func NewHandler(registry *Registry) http.Handler {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", healthHandler)
++	mux.HandleFunc("GET /devices/{device_id}/recordings", registry.recordingsHandler)
++	mux.HandleFunc("GET /devices/{device_id}/recordings/stream", registry.recordingStreamHandler)
++	mux.HandleFunc("DELETE /devices/{device_id}/recordings/{start}", registry.recordingDeleteHandler)
+ 	mux.HandleFunc("POST /devices/{device_id}/talkback", registry.talkbackHandler)
+ 	mux.HandleFunc("GET /devices", func(writer http.ResponseWriter, request *http.Request) {
+ 		writeJSON(writer, http.StatusOK, map[string]any{
+--- a/camera-bridge/internal/plaf203/login_test.go
++++ b/camera-bridge/internal/plaf203/login_test.go
+@@ -74,7 +74,7 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if len(packet) != loginRequestLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != clientSessionMagicVersion || packet[3] != sessionFlags {
++	if len(packet) != loginRequestLength || packet[0] != 0x04 || packet[1] != 0x02 || packet[2] != clientSessionMagicVersion || packet[3] != clientSessionFlags {
+ 		t.Fatalf("unexpected login header: %x", packet[:4])
+ 	}
+ 	if binary.LittleEndian.Uint16(packet[4:]) != loginRequestLength-16 || binary.LittleEndian.Uint16(packet[6:]) != request.Sequence || binary.LittleEndian.Uint16(packet[8:]) != clientSessionOpcode || binary.LittleEndian.Uint16(packet[10:]) != clientSessionSubtype {
+--- a/camera-bridge/internal/plaf203/media_test.go
++++ b/camera-bridge/internal/plaf203/media_test.go
+@@ -165,8 +165,8 @@
+ 	if len(transport.sent) != 2 {
+ 		t.Fatalf("controls sent=%d want=2", len(transport.sent))
+ 	}
+-	start := tutk.ReverseTransCodePartial(nil, transport.sent[0])
+-	stop := tutk.ReverseTransCodePartial(nil, transport.sent[1])
++	start := tutk.ReverseTransCodeBlob(transport.sent[0])
++	stop := tutk.ReverseTransCodeBlob(transport.sent[1])
+ 	assertControlPacket(t, start, controlChannelSystem, controlStartAudio, make([]byte, audioControlArgumentSize))
+ 	assertControlPacket(t, stop, controlChannelSystem, controlStopAudio, make([]byte, audioControlArgumentSize))
+ 	if len(start) != 76 || len(stop) != 76 {
+--- a/camera-bridge/internal/plaf203/protocol_test.go
++++ b/camera-bridge/internal/plaf203/protocol_test.go
+@@ -140,7 +140,9 @@
+ 	if counters.seqSendCmd1 != 8 || counters.seqSendCnt != 4 || state.seqSendCmd1 != 9 || state.seqRecvPkt0 != 0x3FFF || state.seqSendCnt != 5 {
+ 		t.Fatalf("state transition counters=%+v state=%+v", counters, state)
+ 	}
+-	if got := encodeClientSessionPacket(sessionID, 15, body); string(got) != string(packet) {
++	// The retained fixture predates the APK's 1d/0b envelope. Its counters,
++	// sequence, and session identity must still match byte for byte.
++	if got := encodeClientSessionPacket(sessionID, 15, body); got[2] != clientSessionMagicVersion || got[3] != clientSessionFlags || string(got[4:]) != string(packet[4:]) {
+ 		t.Fatalf("counters packet=%x want=%x", got, packet)
+ 	}
+ }
+@@ -341,7 +343,7 @@
+ 		},
+ 	}
+ 	transport.onSend = func(packet []byte, address *net.UDPAddr) {
+-		decoded := tutk.ReverseTransCodePartial(nil, packet)
++		decoded := tutk.ReverseTransCodeBlob(packet)
+ 		if len(decoded) != lanSearchLength {
+ 			return
+ 		}
+@@ -367,7 +369,7 @@
+ 		},
+ 	}
+ 	transport.onSend = func(packet []byte, address *net.UDPAddr) {
+-		decoded := tutk.ReverseTransCodePartial(nil, packet)
++		decoded := tutk.ReverseTransCodeBlob(packet)
+ 		if len(decoded) != lanSearchLength || address == nil || !address.IP.Equal(broadcastIP) {
+ 			return
+ 		}
+@@ -409,15 +411,15 @@
+ func TestDirectConnectorCompletesVerifiedLoginAndKeepsSessionOpen(t *testing.T) {
+ 	transport := &fakeTransport{}
+ 	transport.onSend = func(packet []byte, address *net.UDPAddr) {
+-		decoded := tutk.ReverseTransCodePartial(nil, packet)
++		decoded := tutk.ReverseTransCodeBlob(packet)
+ 		if len(decoded) == lanSearchLength && binary.LittleEndian.Uint16(decoded[8:]) == lanSearchOpcode && decoded[lanSearchPhase] == 1 {
+-			transport.addResponse(tutk.TransCodePartial(nil, testLANSearchResponse(protocolTestUID)), &net.UDPAddr{IP: net.ParseIP("192.0.2.25"), Port: 41135})
++			transport.addResponse(tutk.TransCodeBlob(testLANSearchResponse(protocolTestUID)), &net.UDPAddr{IP: net.ParseIP("192.0.2.25"), Port: 41135})
+ 			return
+ 		}
+ 		if len(decoded) == loginRequestLength && binary.LittleEndian.Uint16(decoded[8:]) == clientSessionOpcode && binary.LittleEndian.Uint16(decoded[6:]) == 1 {
+ 			var sessionID [8]byte
+ 			copy(sessionID[:], decoded[20:28])
+-			transport.addResponse(tutk.TransCodePartial(nil, testLoginSuccess(sessionID)), address)
++			transport.addResponse(tutk.TransCodeBlob(testLoginSuccess(sessionID)), address)
+ 			return
+ 		}
+ 		if len(decoded) < sessionHeaderLength+controlInnerLength || binary.LittleEndian.Uint16(decoded[8:]) != clientSessionOpcode || decoded[sessionHeaderLength] != 0x0C {
+@@ -429,15 +431,15 @@
+ 		copy(sessionID[:], decoded[20:28])
+ 		switch controlType {
+ 		case controlGetFormat:
+-			transport.addResponse(tutk.TransCodePartial(nil, testControlReply(sessionID, controlChannelStream, 0, 0x0040)), address)
+-			transport.addResponse(tutk.TransCodePartial(nil, testControlReply(sessionID, controlChannelStream, 0, controlSetStreamReply)), address)
+-			transport.addResponse(tutk.TransCodePartial(nil, testControlReply(sessionID, controlChannelSystem, 1, controlGetFormatReply)), address)
++			transport.addResponse(tutk.TransCodeBlob(testControlReply(sessionID, controlChannelStream, 0, 0x0040)), address)
++			transport.addResponse(tutk.TransCodeBlob(testControlReply(sessionID, controlChannelStream, 0, controlSetStreamReply)), address)
++			transport.addResponse(tutk.TransCodeBlob(testControlReply(sessionID, controlChannelSystem, 1, controlGetFormatReply)), address)
+ 		case controlStartVideo:
+ 			if received := transport.ReceiveCount(); received != 5 {
+ 				t.Fatalf("IPCAM_START sent after %d received packets, want discovery, LOGIN, and all three control replies", received)
+ 			}
+-			transport.addResponse(tutk.TransCodePartial(nil, testVideoFragment(sessionID, 0x4000, 2, 0, false, 0, []byte{0, 0, 0, 1, 0x67, 1})), address)
+-			transport.addResponse(tutk.TransCodePartial(nil, testVideoFragment(sessionID, 0x4001, 2, 1, true, 0, append([]byte{0, 0, 0, 1, 0x65, 2}, testMediaTrailer(42)...))), address)
++			transport.addResponse(tutk.TransCodeBlob(testVideoFragment(sessionID, 0x4000, 2, 0, false, 0, []byte{0, 0, 0, 1, 0x67, 1})), address)
++			transport.addResponse(tutk.TransCodeBlob(testVideoFragment(sessionID, 0x4001, 2, 1, true, 0, append([]byte{0, 0, 0, 1, 0x65, 2}, testMediaTrailer(42)...))), address)
+ 		}
+ 	}
+ 	connector := &DirectConnector{
+@@ -483,7 +485,7 @@
+ 	}
+ 	bootstrapPackets := make([][]byte, 0, 11)
+ 	for _, packet := range transport.sent[4:] {
+-		bootstrapPackets = append(bootstrapPackets, tutk.ReverseTransCodePartial(nil, packet))
++		bootstrapPackets = append(bootstrapPackets, tutk.ReverseTransCodeBlob(packet))
+ 	}
+ 	if len(bootstrapPackets) != 11 || len(bootstrapPackets[0]) != loginRequestLength || len(bootstrapPackets[1]) != loginRequestLength {
+ 		t.Fatalf("unexpected bootstrap login pair: %d packets", len(bootstrapPackets))
+@@ -510,7 +512,7 @@
+ 		t.Fatalf("post-start counters=%x", body)
+ 	}
+ 	startWire := transport.sent[len(transport.sent)-2]
+-	startDecoded := tutk.ReverseTransCodePartial(nil, startWire)
++	startDecoded := tutk.ReverseTransCodeBlob(startWire)
+ 	if len(startWire) != 76 || len(startDecoded) != 76 || binary.LittleEndian.Uint16(startDecoded[8:10]) != clientSessionOpcode || binary.LittleEndian.Uint16(startDecoded[10:12]) != clientSessionSubtype || binary.LittleEndian.Uint16(startDecoded[6:8]) != 11 {
+ 		t.Fatalf("unexpected IPCAM_START Session16 envelope: wire=%x decoded=%x", startWire, startDecoded)
+ 	}
+@@ -651,7 +653,7 @@
+ 
+ func configureDiscoveryResponder(transport *fakeTransport, onLoginSend func([]byte, *net.UDPAddr)) {
+ 	transport.onSend = func(packet []byte, address *net.UDPAddr) {
+-		decoded := tutk.ReverseTransCodePartial(nil, packet)
++		decoded := tutk.ReverseTransCodeBlob(packet)
+ 		if len(decoded) == lanSearchLength && binary.LittleEndian.Uint16(decoded[8:]) == lanSearchOpcode && decoded[lanSearchPhase] == 1 {
+ 			transport.addResponse(tutk.TransCodePartial(nil, testLANSearchResponse(protocolTestUID)), &net.UDPAddr{IP: net.ParseIP("192.0.2.25"), Port: 40238})
+ 			return
